@@ -1,0 +1,75 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  macOS LaunchAgent — runs the Wheel scheduler whenever you are logged in.
+  Restarts automatically if the process crashes (KeepAlive).
+
+  Prereqs (once):
+    cd /path/to/wheel_bot && uv sync
+    (creates .venv — required)
+
+  Uses .venv/bin/python directly (no shell script) so macOS does not block
+  execution with "Operation not permitted" on Desktop paths.
+
+  If you still see errors: move the repo out of Desktop (e.g. ~/Developer/trading_bot),
+  or run: xattr -dr com.apple.quarantine /path/to/wheel_bot
+
+  Install (edit paths below if your project is not under Desktop/trading_bot):
+    cp com.wheelbot.scheduler.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.wheelbot.scheduler.plist
+    # Or legacy:
+    # launchctl load ~/Library/LaunchAgents/com.wheelbot.scheduler.plist
+
+  Uninstall:
+    launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.wheelbot.scheduler.plist
+    rm ~/Library/LaunchAgents/com.wheelbot.scheduler.plist
+
+  Status:
+    launchctl print gui/$(id -u)/com.wheelbot.scheduler
+
+  Logs:
+    tail -f logs/launchd_stdout.log logs/launchd_stderr.log
+    tail -f logs/wheel_*.log
+
+  Note: Stops when you log out. For 24/7 while away, keep the Mac awake
+  (Energy Saver) or run the same stack on a small VPS/Linux with systemd.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.wheelbot.scheduler</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/wonwoochoi/Desktop/trading_bot/wheel_bot/.venv/bin/python</string>
+    <string>/Users/wonwoochoi/Desktop/trading_bot/wheel_bot/scheduler.py</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/wonwoochoi/Desktop/trading_bot/wheel_bot</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>/Users/wonwoochoi/Desktop/trading_bot/wheel_bot/logs/launchd_stdout.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/wonwoochoi/Desktop/trading_bot/wheel_bot/logs/launchd_stderr.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PYTHONUNBUFFERED</key>
+    <string>1</string>
+  </dict>
+</dict>
+</plist>
