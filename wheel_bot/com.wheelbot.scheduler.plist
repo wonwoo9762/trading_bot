@@ -5,12 +5,8 @@
   macOS LaunchAgent — runs the Wheel scheduler whenever you are logged in.
   Restarts automatically if the process crashes (KeepAlive).
 
-  Prereqs (once):
-    cd /path/to/wheel_bot && uv sync
-    (creates .venv — required)
-
-  Uses .venv/bin/python directly (no shell script) so macOS does not block
-  execution with "Operation not permitted" on Desktop paths.
+  Uses uv directly so the project environment is created/used from
+  pyproject.toml + uv.lock before scheduler.py starts.
 
   If you still see errors: move the repo out of Desktop (e.g. ~/Developer/trading_bot),
   or run: xattr -dr com.apple.quarantine /path/to/wheel_bot
@@ -42,8 +38,11 @@
 
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/wonwoochoi/Desktop/trading_bot/wheel_bot/.venv/bin/python</string>
-    <string>/Users/wonwoochoi/Desktop/trading_bot/wheel_bot/scheduler.py</string>
+    <string>/Users/wonwoochoi/.local/bin/uv</string>
+    <string>run</string>
+    <string>python</string>
+    <string>scheduler.py</string>
+    <string>--run-on-start</string>
   </array>
 
   <key>WorkingDirectory</key>

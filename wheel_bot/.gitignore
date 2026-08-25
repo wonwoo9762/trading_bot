@@ -1,4 +1,5 @@
 .env
 .venv/
-logs/
+logs/*
+!logs/.gitkeep
 data/

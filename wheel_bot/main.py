@@ -1,5 +1,6 @@
-def main():
-    print("Hello from wheel-bot!")
+"""Package entrypoint for the deployed Wheel bot."""
+
+from scheduler import main
 
 
 if __name__ == "__main__":

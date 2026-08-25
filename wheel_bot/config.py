@@ -1,4 +1,4 @@
-"""Load API keys from environment or .env. Never commit .env."""
+"""Load API keys and runtime toggles from environment or .env."""
 import os
 from pathlib import Path
 
@@ -14,10 +14,20 @@ def _strip_env(key: str) -> str | None:
     return v.strip() if v else None
 
 
+def _env_bool(key: str, default: bool = False) -> bool:
+    v = os.environ.get(key)
+    if v is None:
+        return default
+    return v.strip().lower() in ("true", "1", "yes", "on")
+
+
 OPENAI_API_KEY = _strip_env("OPENAI_API_KEY")
 ALPACA_API_KEY = _strip_env("ALPACA_API_KEY")
 ALPACA_SECRET_KEY = _strip_env("ALPACA_SECRET_KEY")
-ALPACA_PAPER_TRADE = os.environ.get("ALPACA_PAPER_TRADE", "True").lower() in ("true", "1", "yes")
+ALPACA_PAPER_TRADE = _env_bool("ALPACA_PAPER_TRADE", True)
+WHEEL_BOT_RUN_ON_START = _env_bool("WHEEL_BOT_RUN_ON_START", False)
+WHEEL_BOT_AUTO_EXECUTE = _env_bool("WHEEL_BOT_AUTO_EXECUTE", False)
+WHEEL_BOT_ALLOW_LIVE_TRADING = _env_bool("WHEEL_BOT_ALLOW_LIVE_TRADING", False)
 
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))

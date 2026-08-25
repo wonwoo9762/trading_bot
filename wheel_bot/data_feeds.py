@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import date, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
@@ -190,23 +191,100 @@ def fetch_macro() -> str:
 
 # ── Fundamentals ───────────────────────────────────────────────────────────
 
+_STATIC_CANDIDATE_UNIVERSE: list[dict[str, object]] = [
+    {
+        "ticker": "AAPL",
+        "fcf": 108_000_000_000,
+        "dte": 1.45,
+        "mkt_cap": 3_000_000_000_000,
+        "liquidity": "Very liquid equity and options market.",
+        "news": "No breaking company-specific risk in local seed data.",
+        "source": "STATIC_SEED_NOT_LIVE",
+    },
+    {
+        "ticker": "MSFT",
+        "fcf": 74_000_000_000,
+        "dte": 0.45,
+        "mkt_cap": 3_000_000_000_000,
+        "liquidity": "Very liquid equity and options market.",
+        "news": "No breaking company-specific risk in local seed data.",
+        "source": "STATIC_SEED_NOT_LIVE",
+    },
+    {
+        "ticker": "GOOGL",
+        "fcf": 69_000_000_000,
+        "dte": 0.10,
+        "mkt_cap": 2_000_000_000_000,
+        "liquidity": "Liquid equity and options market.",
+        "news": "No breaking company-specific risk in local seed data.",
+        "source": "STATIC_SEED_NOT_LIVE",
+    },
+    {
+        "ticker": "AMZN",
+        "fcf": 36_000_000_000,
+        "dte": 0.80,
+        "mkt_cap": 1_800_000_000_000,
+        "liquidity": "Liquid equity and options market.",
+        "news": "No breaking company-specific risk in local seed data.",
+        "source": "STATIC_SEED_NOT_LIVE",
+    },
+    {
+        "ticker": "META",
+        "fcf": 43_000_000_000,
+        "dte": 0.25,
+        "mkt_cap": 1_000_000_000_000,
+        "liquidity": "Liquid equity and options market.",
+        "news": "No breaking company-specific risk in local seed data.",
+        "source": "STATIC_SEED_NOT_LIVE",
+    },
+]
+
+
+def _configured_candidate_tickers() -> list[str]:
+    raw = os.environ.get("WHEEL_BOT_CANDIDATE_TICKERS", "")
+    return [t.strip().upper() for t in raw.split(",") if t.strip()]
+
+
+def fetch_candidate_universe(tickers: list[str] | None = None) -> str:
+    """Return candidate stocks for the CASH path.
+
+    This is a local seed universe, not a live fundamentals/news feed.  Replace
+    this function with a real market-data/news provider when available.
+    """
+    requested = [t.upper() for t in (tickers or _configured_candidate_tickers())]
+    universe = list(_STATIC_CANDIDATE_UNIVERSE)
+    if requested:
+        known = {str(row["ticker"]).upper(): row for row in universe}
+        universe = [
+            known.get(t)
+            or {
+                "ticker": t,
+                "fcf": None,
+                "dte": None,
+                "mkt_cap": None,
+                "liquidity": "UNKNOWN",
+                "news": "No local seed data; exclude unless external data is provided.",
+                "source": "USER_CONFIGURED_NO_STATIC_METRICS",
+            }
+            for t in requested
+        ]
+    return json.dumps(universe)
+
+
 def fetch_fundamentals(tickers: list[str] | None = None) -> str:
     """Return fundamental metrics for a set of tickers.
 
     In production, wire this to a fundamentals API (e.g. Financial
-    Modeling Prep, Alpha Vantage, or Polygon.io).  For now, returns
-    an empty list so the screener conservatively passes nothing.
+    Modeling Prep, Alpha Vantage, or Polygon.io).  For now, returns the same
+    local seed universe used by the candidate selector.
     """
-    # TODO: Integrate a real fundamentals provider.
-    if not tickers:
-        return "[]"
-    logger.info("Fundamentals fetch requested for %s (stub)", tickers)
-    return "[]"
+    logger.info("Fundamentals fetch requested for %s (seed universe)", tickers or "default")
+    return fetch_candidate_universe(tickers)
 
 
 # ── Options chain ──────────────────────────────────────────────────────────
 
-def fetch_options_chain(ticker: str) -> str:
+def fetch_options_chain(ticker: str, contract_type: str | None = None) -> str:
     """Fetch the options chain for *ticker* from Alpaca.
 
     Requires an Alpaca subscription that includes options data.
@@ -225,25 +303,65 @@ def fetch_options_chain(ticker: str) -> str:
         from alpaca.trading.requests import GetOptionContractsRequest
 
         today = date.today()
-        req = GetOptionContractsRequest(
-            underlying_symbols=[ticker.upper()],
-            expiration_date_gte=today.isoformat(),
-            expiration_date_lte=(today + timedelta(days=60)).isoformat(),
-            status="active",
-        )
+        req_kwargs = {
+            "underlying_symbols": [ticker.upper()],
+            "expiration_date_gte": today.isoformat(),
+            "expiration_date_lte": (today + timedelta(days=60)).isoformat(),
+            "status": "active",
+            "limit": 100,
+        }
+        if contract_type:
+            from alpaca.trading.enums import ContractType
+
+            req_kwargs["type"] = ContractType(contract_type.lower())
+        req = GetOptionContractsRequest(**req_kwargs)
         resp = client.get_option_contracts(req)
         contracts = resp.option_contracts if resp else []
 
         if not contracts:
             return f"OPTIONS_CHAIN_EMPTY: No active contracts for {ticker} within 60 days"
 
+        selected = contracts[:100]
+        symbols = [str(c.symbol) for c in selected]
+        snapshots = _fetch_option_snapshots(symbols, k, s)
+        quotes = {} if snapshots else _fetch_option_latest_quotes(symbols, k, s)
+
         lines: list[str] = []
-        for c in contracts[:30]:
-            lines.append(
-                f"[{c.type.value.title()} {c.strike_price} "
-                f"Exp {c.expiration_date} "
-                f"Symbol: {c.symbol}]"
+        for c in selected:
+            symbol = str(c.symbol)
+            contract_type = getattr(c.type, "value", c.type)
+            snapshot = snapshots.get(symbol)
+            q = _read_field(snapshot, "latest_quote", "latestQuote") or quotes.get(symbol)
+            bid = _read_field(q, "bid_price", "bp")
+            ask = _read_field(q, "ask_price", "ap")
+            greeks = _read_field(snapshot, "greeks")
+            delta = _safe_float(_read_field(greeks, "delta"))
+            pop = _delta_proxy_pop(delta)
+            iv = _safe_float(
+                _read_field(snapshot, "implied_volatility", "impliedVolatility")
             )
+            close = getattr(c, "close_price", None)
+            oi = getattr(c, "open_interest", None)
+
+            parts = [
+                f"[{str(contract_type).title()} {c.strike_price}",
+                f"Exp {c.expiration_date}",
+                f"Symbol: {symbol}",
+            ]
+            if bid is not None and ask is not None:
+                parts.append(f"Bid: {bid}")
+                parts.append(f"Ask: {ask}")
+            if delta is not None:
+                parts.append(f"Delta: {delta:.4f}")
+            if pop is not None:
+                parts.append(f"POP: {pop:.1f}%")
+            if iv is not None:
+                parts.append(f"IV: {iv:.4f}")
+            if close is not None:
+                parts.append(f"Close: {close}")
+            if oi is not None:
+                parts.append(f"OI: {oi}")
+            lines.append(" ".join(parts) + "]")
         return "\n".join(lines)
 
     except ImportError:
@@ -252,6 +370,89 @@ def fetch_options_chain(ticker: str) -> str:
     except Exception as exc:
         logger.warning("Options chain fetch failed for %s: %s", ticker, exc)
         return f"OPTIONS_CHAIN_ERROR: {exc}"
+
+
+def _read_field(obj: object, *names: str) -> object | None:
+    if obj is None:
+        return None
+    for name in names:
+        if isinstance(obj, dict):
+            if name in obj:
+                return obj[name]
+        else:
+            value = getattr(obj, name, None)
+            if value is not None:
+                return value
+    return None
+
+
+def _safe_float(value: object) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _delta_proxy_pop(delta: float | None) -> float | None:
+    """Estimate short-option POP from delta, capped to a 0-100 percentage."""
+    if delta is None:
+        return None
+    return max(0.0, min(100.0, (1.0 - min(1.0, abs(delta))) * 100.0))
+
+
+def _fetch_option_snapshots(
+    symbols: list[str], api_key: str, secret_key: str
+) -> dict[str, object]:
+    """Fetch option snapshots with quote, IV, and Greeks when available."""
+    if not symbols:
+        return {}
+
+    try:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        from alpaca.data.requests import OptionSnapshotRequest
+
+        data_client = OptionHistoricalDataClient(api_key, secret_key)
+        return data_client.get_option_snapshot(
+            OptionSnapshotRequest(symbol_or_symbols=symbols)
+        )
+    except ModuleNotFoundError as exc:
+        logger.warning(
+            "Option snapshot fetch failed: missing dependency '%s'. "
+            "Run `uv sync` so option chains include live Bid/Ask, Greeks, and POP.",
+            exc.name,
+        )
+        return {}
+    except Exception as exc:
+        logger.warning("Option snapshot fetch failed: %s", exc)
+        return {}
+
+
+def _fetch_option_latest_quotes(
+    symbols: list[str], api_key: str, secret_key: str
+) -> dict[str, object]:
+    """Fetch latest option quotes; return an empty map if unavailable."""
+    if not symbols:
+        return {}
+
+    try:
+        from alpaca.data.historical.option import OptionHistoricalDataClient
+        from alpaca.data.requests import OptionLatestQuoteRequest
+
+        data_client = OptionHistoricalDataClient(api_key, secret_key)
+        return data_client.get_option_latest_quote(
+            OptionLatestQuoteRequest(symbol_or_symbols=symbols)
+        )
+    except ModuleNotFoundError as exc:
+        logger.warning(
+            "Latest option quote fetch failed: missing dependency '%s'. "
+            "Run `uv sync` so option chains include live Bid/Ask spreads; "
+            "without spreads the execution broker will block trades.",
+            exc.name,
+        )
+        return {}
+    except Exception as exc:
+        logger.warning("Latest option quote fetch failed: %s", exc)
+        return {}
 
 
 # ── Liquidation snapshot ──────────────────────────────────────────────────

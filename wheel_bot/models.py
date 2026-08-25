@@ -25,6 +25,16 @@ class OrchestratorOutput(BaseModel):
     action: str = Field(description="Human-readable rationale for the route")
 
 
+class CandidateSelectorOutput(BaseModel):
+    """Candidate universe selector result."""
+
+    selected_tickers: list[str] = Field(
+        default_factory=list,
+        description="Ticker symbols worth passing to the fundamental screener",
+    )
+    reason: str = Field(default="", description="Short selection rationale")
+
+
 class ScreenerOutput(BaseModel):
     """Fundamental Screener result."""
 
@@ -67,12 +77,37 @@ class CROOutput(BaseModel):
     reason: str
 
 
+class BrokerLeg(BaseModel):
+    """Single leg for an Alpaca multi-leg option order."""
+
+    symbol: str
+    ratio_qty: float = 1
+    side: Optional[Literal["buy", "sell"]] = None
+    position_intent: Optional[
+        Literal["buy_to_open", "buy_to_close", "sell_to_open", "sell_to_close"]
+    ] = None
+
+
 class BrokerOutput(BaseModel):
     """Execution Broker limit-order parameters."""
 
+    symbol: Optional[str] = Field(
+        default=None,
+        description="Alpaca/OCC option contract symbol for simple option orders",
+    )
+    side: Optional[Literal["buy", "sell"]] = None
+    qty: Optional[int] = Field(
+        default=None,
+        description="Whole number of option contracts",
+    )
     initial_limit: Optional[float] = None
+    limit_price: Optional[float] = Field(
+        default=None,
+        description="Limit price to submit. For mleg credit orders, use a negative value.",
+    )
     step_down: Optional[float] = None
     floor_price: Optional[float] = None
+    legs: list[BrokerLeg] = Field(default_factory=list)
     error: Optional[str] = Field(
         default=None,
         description="Set when spread data is missing or ticket is unexecutable",

@@ -40,6 +40,7 @@ def send_run_report(
     ticker: str = "N/A",
     account_snapshot: dict | None = None,
     portfolio_json: str | None = None,
+    transaction_summary: dict | None = None,
     extra_recipients: list[str] | None = None,
 ) -> bool:
     """Send the Wheel pipeline output as a formatted email.
@@ -53,6 +54,8 @@ def send_run_report(
         The ``portfolio_state`` JSON passed into ``run_trading_flow`` for this
         run.  Shown as "Strategy input" so the pipeline math (e.g. NLV in
         DRAFT_TICKET) matches what the graph used.
+    transaction_summary : dict, optional
+        Scheduler-built explanation of whether an order was submitted and why.
 
     Returns True if the email was sent, False on any failure (logged, never
     raises — notifications must not crash the scheduler).
@@ -85,7 +88,26 @@ def send_run_report(
         ts=now,
         account=account_snapshot,
         portfolio_json=portfolio_json,
+        transaction_summary=transaction_summary,
     )
+
+    plain_tx = ""
+    if transaction_summary:
+        outcome = (
+            "Transaction made"
+            if transaction_summary.get("transaction_made")
+            else "No transaction made"
+        )
+        plain_tx = (
+            "--- Transaction summary ---\n"
+            f"Outcome: {outcome}\n"
+            f"Status: {transaction_summary.get('status', 'N/A')}\n"
+            f"Action: {transaction_summary.get('action', 'N/A')}\n"
+            f"Symbol: {transaction_summary.get('symbol', 'N/A')}\n"
+        )
+        if transaction_summary.get("order_id"):
+            plain_tx += f"Order ID: {transaction_summary['order_id']}\n"
+        plain_tx += f"Why: {transaction_summary.get('why', '')}\n\n"
 
     plain_acct = ""
     if account_snapshot and "error" not in account_snapshot:
@@ -120,6 +142,7 @@ def send_run_report(
     plain_body = (
         f"Wheel Bot {run_label} run — {ticker}\n"
         f"{now.strftime('%Y-%m-%d %H:%M:%S')} ET\n\n"
+        f"{plain_tx}"
         f"{plain_acct}"
         f"{plain_strategy}"
         f"{result}"
@@ -154,9 +177,45 @@ def _build_html(
     ts: datetime,
     account: dict | None = None,
     portfolio_json: str | None = None,
+    transaction_summary: dict | None = None,
 ) -> str:
     """Convert the pipeline result text into a clean HTML email."""
     from data_feeds import summarize_portfolio_json_for_email
+
+    def esc(value: object) -> str:
+        return (
+            str(value or "")
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+
+    transaction_html = ""
+    if transaction_summary:
+        made = bool(transaction_summary.get("transaction_made"))
+        accent = "#27ae60" if made else "#c0392b"
+        bg = "#edf8f0" if made else "#fff4f2"
+        outcome = "Transaction made" if made else "No transaction made"
+        order_id = transaction_summary.get("order_id")
+        order_line = (
+            f'<p style="margin:6px 0 0;font-size:13px;color:#555;">'
+            f'<strong>Order ID:</strong> {esc(order_id)}</p>'
+            if order_id
+            else ""
+        )
+        transaction_html = (
+            f'<div style="background:{bg};border:1px solid {accent};border-radius:8px;'
+            'padding:14px;margin-bottom:16px;">'
+            f'<strong style="color:{accent};font-size:15px;">{outcome}</strong>'
+            f'<p style="margin:8px 0 0;font-size:13px;color:#555;">'
+            f'<strong>Status:</strong> {esc(transaction_summary.get("status", "N/A"))}'
+            f' &nbsp; <strong>Action:</strong> {esc(transaction_summary.get("action", "N/A"))}'
+            f' &nbsp; <strong>Symbol:</strong> {esc(transaction_summary.get("symbol", "N/A"))}</p>'
+            f'{order_line}'
+            f'<p style="margin:8px 0 0;font-size:14px;color:#333;">'
+            f'{esc(transaction_summary.get("why", ""))}</p>'
+            '</div>'
+        )
 
     # ── Account snapshot section ──────────────────────────────────────
     account_html = ""
@@ -309,6 +368,7 @@ def _build_html(
     <p style="margin:0 0 16px;color:#888;font-size:14px;">
       {ticker} &nbsp;|&nbsp; {ts.strftime('%b %d, %Y  %I:%M %p')} ET
     </p>
+    {transaction_html}
     {account_html}
     {strategy_html}
     <h3 style="margin:0 0 8px;font-size:15px;color:#555;">Pipeline Result</h3>
@@ -318,9 +378,7 @@ def _build_html(
     <p style="margin:16px 0 0;color:#aaa;font-size:12px;">
       <strong>Account Overview</strong> is from Alpaca at send time.
       <strong>Strategy input</strong> is what the graph used for this run (scheduler).
-      <strong>Pipeline Result</strong> is LLM output. If you ran <code>python -m agents.graph</code>
-      with a demo JSON, numbers may not match your Alpaca balance.
-      No trades were executed — review and approve manually.
+      <strong>Pipeline Result</strong> is LLM output and broker outcome details.
     </p>
   </div>
 </body>

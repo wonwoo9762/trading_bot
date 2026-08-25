@@ -4,7 +4,7 @@ Architecture
 ────────────
 START → preflight → macro_sentinel → orchestrator → data_gate ─┐
   ┌────────────────────────────────────────────────────────────┘
-  ├─ CASH       → screener → put_drafter ──┐
+  ├─ CASH       → candidate_selector → screener → chain → put_drafter ──┐
   ├─ NOMINAL    → nominal_ticket ──────────┤
   └─ DISTRESSED → quant → assessor → decider ──┤
                                                 ↓
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Annotated, Any, TypedDict, TypeVar
 
@@ -37,12 +38,14 @@ from models import (
     AssessorOutput,
     BrokerOutput,
     CROOutput,
+    CandidateSelectorOutput,
     MacroSentinelOutput,
     OrchestratorOutput,
     QuantOutput,
     ScreenerOutput,
 )
 from prompts import (
+    CANDIDATE_SELECTOR_PROMPT,
     CHIEF_RISK_OFFICER_PROMPT,
     EXECUTION_BROKER_PROMPT,
     FUNDAMENTAL_SCREENER_PROMPT,
@@ -76,6 +79,7 @@ class WheelState(TypedDict, total=False):
     # Inputs (immutable after START)
     portfolio_state: str
     macro_input: str
+    candidate_universe_input: str
     fundamentals_input: str
     options_chain_input: str
     liquidation_input: str
@@ -97,6 +101,7 @@ class WheelState(TypedDict, total=False):
     # Outputs (serialised Pydantic JSON or abort message)
     macro_output: str
     orchestrator_output: str
+    candidate_selector_output: str
     screener_output: str
     quant_output: str
     opportunity_output: str
@@ -228,6 +233,84 @@ def _parse_portfolio(raw: str) -> dict[str, float] | None:
     }
 
 
+def _parse_option_chain_contracts(options_chain: str) -> list[dict[str, Any]]:
+    contracts: list[dict[str, Any]] = []
+    for line in (options_chain or "").splitlines():
+        kind = re.search(r"\[(Call|Put)\s+([0-9.]+)", line, re.IGNORECASE)
+        symbol = re.search(r"Symbol:\s+([A-Z0-9]+)", line)
+        if not kind or not symbol:
+            continue
+
+        def _num(label: str) -> float | None:
+            match = re.search(label + r":\s*(-?[0-9.]+)%?", line, re.IGNORECASE)
+            if not match:
+                return None
+            try:
+                return float(match.group(1))
+            except ValueError:
+                return None
+
+        exp = re.search(r"Exp\s+([0-9A-Za-z_.\-/]+)", line)
+        try:
+            strike = float(kind.group(2))
+        except ValueError:
+            continue
+
+        contracts.append(
+            {
+                "type": kind.group(1).lower(),
+                "strike": strike,
+                "expiration": exp.group(1) if exp else None,
+                "symbol": symbol.group(1),
+                "bid": _num("Bid"),
+                "ask": _num("Ask"),
+                "delta": _num("Delta"),
+                "pop": _num("POP"),
+            }
+        )
+    return contracts
+
+
+def _select_cash_secured_put_contract(
+    options_chain: str, max_risk: float
+) -> tuple[dict[str, Any] | None, str]:
+    contracts = _parse_option_chain_contracts(options_chain)
+    if not contracts:
+        return None, "options chain contained no parseable contracts"
+
+    puts = [c for c in contracts if c.get("type") == "put"]
+    if not puts:
+        return None, "options chain contained no put contracts"
+
+    eligible: list[dict[str, Any]] = []
+    for c in puts:
+        bid = c.get("bid")
+        ask = c.get("ask")
+        pop = c.get("pop")
+        strike = c.get("strike")
+        if bid is None or ask is None or pop is None or strike is None:
+            continue
+        if float(pop) <= 70:
+            continue
+        if float(strike) * 100 > max_risk:
+            continue
+        candidate = dict(c)
+        candidate["mid"] = round((float(bid) + float(ask)) / 2, 2)
+        eligible.append(candidate)
+
+    if not eligible:
+        return (
+            None,
+            "no put contract had Bid/Ask, POP > 70%, and strike x 100 within max_risk",
+        )
+
+    selected = max(
+        eligible,
+        key=lambda c: (float(c.get("bid") or 0), float(c.get("pop") or 0)),
+    )
+    return selected, "selected highest-bid put that passed POP and max-risk filters"
+
+
 # ── Node functions (in execution order) ───────────────────────────────────
 
 def preflight_node(state: WheelState) -> WheelState:
@@ -237,6 +320,7 @@ def preflight_node(state: WheelState) -> WheelState:
         for k in (
             "portfolio_state",
             "macro_input",
+            "candidate_universe_input",
             "fundamentals_input",
             "options_chain_input",
             "liquidation_input",
@@ -309,6 +393,8 @@ def data_gate_node(state: WheelState) -> WheelState:
         reasons.append("macro_input is empty")
 
     if route == "CASH":
+        if not (state.get("candidate_universe_input") or state.get("fundamentals_input") or "").strip():
+            reasons.append("candidate_universe_input required for CASH path")
         if not (state.get("fundamentals_input") or "").strip():
             reasons.append("fundamentals_input required for CASH path")
     elif route == "ASSET_NOMINAL":
@@ -334,9 +420,87 @@ def data_blocked_node(state: WheelState) -> WheelState:
     }
 
 
+def _load_json_list(raw: str) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(raw or "[]")
+    except Exception:
+        return []
+    if not isinstance(data, list):
+        return []
+    return [row for row in data if isinstance(row, dict)]
+
+
+def _filter_json_rows_by_tickers(raw: str, tickers: list[str]) -> str:
+    wanted = {t.upper() for t in tickers}
+    rows = _load_json_list(raw)
+    if not rows or not wanted:
+        return raw
+    filtered = [row for row in rows if str(row.get("ticker", "")).upper() in wanted]
+    return json.dumps(filtered)
+
+
+def _deterministic_candidate_fallback(raw: str) -> CandidateSelectorOutput:
+    rows = _load_json_list(raw)
+    selected: list[str] = []
+    for row in rows:
+        try:
+            ticker = str(row.get("ticker", "")).upper()
+            fcf = float(row.get("fcf") or 0)
+            dte = float(row.get("dte") or 999)
+            mkt_cap = float(row.get("mkt_cap") or 0)
+        except (TypeError, ValueError):
+            continue
+        if ticker and fcf > 0 and dte < 1.5 and mkt_cap > 50_000_000_000:
+            selected.append(ticker)
+        if len(selected) >= 5:
+            break
+    return CandidateSelectorOutput(
+        selected_tickers=selected,
+        reason="DETERMINISTIC_FALLBACK_STATIC_UNIVERSE",
+    )
+
+
+def candidate_selector_node(state: WheelState) -> WheelState:
+    """Pick CASH-path candidates from local/news/fundamental universe input."""
+    universe = (
+        state.get("candidate_universe_input")
+        or state.get("fundamentals_input")
+        or "[]"
+    )
+    human = (
+        f"Macro context: {state.get('macro_input', '')}\n"
+        f"Candidate universe: {universe}"
+    )
+    raw, parsed = _invoke_structured(
+        CandidateSelectorOutput,
+        CANDIDATE_SELECTOR_PROMPT,
+        human,
+    )
+    if parsed is None:
+        parsed = _deterministic_candidate_fallback(universe)
+
+    out: WheelState = {"candidate_selector_output": parsed.model_dump_json()}
+    if raw is not None:
+        out["messages"] = [raw]
+    return out
+
+
 def fundamental_screener_node(state: WheelState) -> WheelState:
     cro_feedback = (state.get("last_cro_reason") or "").strip()
-    human = f"Input: {state.get('fundamentals_input', '')}"
+    fundamentals = state.get("fundamentals_input", "") or "[]"
+
+    try:
+        selector = CandidateSelectorOutput.model_validate_json(
+            state.get("candidate_selector_output", "") or "{}"
+        )
+        if selector.selected_tickers:
+            fundamentals = _filter_json_rows_by_tickers(
+                fundamentals, selector.selected_tickers
+            )
+    except Exception:
+        pass
+
+    human = f"Input: {fundamentals}"
     if cro_feedback:
         human += (
             f"\nPrevious CRO rejection (exclude problematic tickers): "
@@ -353,6 +517,27 @@ def fundamental_screener_node(state: WheelState) -> WheelState:
     if raw is not None:
         out["messages"] = [raw]
     return out
+
+
+def cash_options_chain_node(state: WheelState) -> WheelState:
+    """Fetch options chain after the screener chooses a CASH-path ticker."""
+    raw_screener = (state.get("screener_output") or "").strip()
+    try:
+        screener = ScreenerOutput.model_validate_json(raw_screener)
+    except Exception:
+        return {}
+    if not screener.approved_tickers:
+        return {}
+
+    ticker = screener.approved_tickers[0]
+    try:
+        from data_feeds import fetch_options_chain
+
+        chain = fetch_options_chain(ticker, contract_type="put")
+    except Exception as exc:
+        logger.exception("Failed to fetch cash-path options chain for %s", ticker)
+        chain = f"OPTIONS_CHAIN_ERROR: {exc}"
+    return {"options_chain_input": chain}
 
 
 def put_drafter_node(state: WheelState) -> WheelState:
@@ -415,13 +600,45 @@ def put_drafter_node(state: WheelState) -> WheelState:
         }
 
     ticker = screener.approved_tickers[0]
+    selected_contract, selection_reason = _select_cash_secured_put_contract(
+        state.get("options_chain_input", ""),
+        max_deploy,
+    )
+    if selected_contract is None:
+        return {
+            "draft_ticket": json.dumps(
+                {
+                    "action": "NO_TRADE",
+                    "reason": (
+                        "No executable cash-secured put candidate: "
+                        f"{selection_reason}"
+                    ),
+                    "ticker": ticker,
+                }
+            ),
+            "ticket_source": "PUT_DRAFTER",
+        }
+
     ticket = {
         "action": "SELL_CSP",
         "ticker": ticker,
+        "symbol": selected_contract["symbol"],
+        "contract_symbol": selected_contract["symbol"],
+        "option_type": "put",
+        "strike": selected_contract["strike"],
+        "expiration": selected_contract.get("expiration"),
+        "bid": selected_contract.get("bid"),
+        "ask": selected_contract.get("ask"),
+        "mid": selected_contract.get("mid"),
+        "delta": selected_contract.get("delta"),
+        "pop": selected_contract.get("pop"),
+        "pop_source": "delta_proxy_from_alpaca_option_snapshot",
+        "selection_reason": selection_reason,
         "max_risk": round(max_deploy, 2),
         "nlv": round(pf["nlv"], 2),
         "max_position_pct": MAX_POSITION_PCT * 100,
         "portfolio_state": state.get("portfolio_state", ""),
+        "options_chain": state.get("options_chain_input", ""),
     }
     return {
         "draft_ticket": json.dumps(ticket),
@@ -668,6 +885,16 @@ def force_liquidation_node(state: WheelState) -> WheelState:
     }
 
 
+def cro_rejected_abort_node(state: WheelState) -> WheelState:
+    return {
+        "abort_reason": (
+            f"CRO_REJECTED: exceeded {CRO_REJECT_MAX} CASH-path retries.  "
+            "No position exists to liquidate; no transaction will be made.  "
+            f"Last: {state.get('last_cro_reason', '')}"
+        ),
+    }
+
+
 def forced_abort_node(state: WheelState) -> WheelState:
     return {
         "abort_reason": (
@@ -770,6 +997,8 @@ def _route_after_cro(state: WheelState) -> str:
         return "abort_forced"
 
     if int(state.get("cro_retries", 0) or 0) >= CRO_REJECT_MAX:
+        if (state.get("active_path") or "").lower() == "cash":
+            return "abort_rejected"
         return "force_liquidation"
     return "rejected"
 
@@ -801,7 +1030,9 @@ def build_graph() -> StateGraph:
     g.add_node("data_gate", data_gate_node)
     g.add_node("data_blocked", data_blocked_node)
 
+    g.add_node("candidate_selector", candidate_selector_node)
     g.add_node("fundamental_screener", fundamental_screener_node)
+    g.add_node("cash_options_chain", cash_options_chain_node)
     g.add_node("put_drafter", put_drafter_node)
     g.add_node("nominal_ticket", nominal_ticket_node)
 
@@ -816,6 +1047,7 @@ def build_graph() -> StateGraph:
     g.add_node("chief_risk_officer", chief_risk_officer_node)
     g.add_node("retry_router", retry_router_node)
     g.add_node("force_liquidation", force_liquidation_node)
+    g.add_node("cro_rejected_abort", cro_rejected_abort_node)
     g.add_node("forced_abort", forced_abort_node)
     g.add_node("execution_broker", execution_broker_node)
 
@@ -840,15 +1072,17 @@ def build_graph() -> StateGraph:
         _route_after_data_gate,
         {
             "blocked": "data_blocked",
-            "cash": "fundamental_screener",
+            "cash": "candidate_selector",
             "nominal": "nominal_ticket",
             "distressed": "distressed_fork",
         },
     )
     g.add_edge("data_blocked", END)
 
-    # Cash path: screener → put_drafter → [NO_TRADE → END | → validator]
-    g.add_edge("fundamental_screener", "put_drafter")
+    # Cash path: candidate_selector → screener → chain → put_drafter
+    g.add_edge("candidate_selector", "fundamental_screener")
+    g.add_edge("fundamental_screener", "cash_options_chain")
+    g.add_edge("cash_options_chain", "put_drafter")
     g.add_conditional_edges(
         "put_drafter",
         _route_after_put_drafter,
@@ -886,10 +1120,12 @@ def build_graph() -> StateGraph:
             "approved": "execution_broker",
             "rejected": "retry_router",
             "force_liquidation": "force_liquidation",
+            "abort_rejected": "cro_rejected_abort",
             "abort_forced": "forced_abort",
         },
     )
     g.add_edge("force_liquidation", "chief_risk_officer")
+    g.add_edge("cro_rejected_abort", END)
     g.add_edge("forced_abort", END)
 
     g.add_conditional_edges(
@@ -915,6 +1151,7 @@ def run_trading_flow(
     portfolio_state: str,
     *,
     macro_input: str = "",
+    candidate_universe_input: str = "",
     fundamentals_input: str = "",
     options_chain_input: str = "",
     liquidation_input: str = "",
@@ -932,6 +1169,36 @@ def run_trading_flow(
         Path to a SQLite database for durable checkpointing.  Falls back to
         in-memory ``MemorySaver`` if ``langgraph-checkpoint-sqlite`` is not
         installed.
+    """
+    return _format_result(
+        run_trading_flow_state(
+            portfolio_state,
+            macro_input=macro_input,
+            candidate_universe_input=candidate_universe_input,
+            fundamentals_input=fundamentals_input,
+            options_chain_input=options_chain_input,
+            liquidation_input=liquidation_input,
+            thread_id=thread_id,
+            checkpoint_db=checkpoint_db,
+        )
+    )
+
+
+def run_trading_flow_state(
+    portfolio_state: str,
+    *,
+    macro_input: str = "",
+    candidate_universe_input: str = "",
+    fundamentals_input: str = "",
+    options_chain_input: str = "",
+    liquidation_input: str = "",
+    thread_id: str | None = None,
+    checkpoint_db: str | None = None,
+) -> dict[str, Any]:
+    """Execute the graph and return the raw terminal state.
+
+    The scheduler uses this so it can pass ``draft_ticket`` and
+    ``execution_output`` to the broker without scraping the formatted report.
     """
     checkpointer = None
     config: dict[str, Any] | None = None
@@ -959,6 +1226,7 @@ def run_trading_flow(
         "messages": [],
         "portfolio_state": portfolio_state,
         "macro_input": macro_input,
+        "candidate_universe_input": candidate_universe_input,
         "fundamentals_input": fundamentals_input,
         "options_chain_input": options_chain_input,
         "liquidation_input": liquidation_input,
@@ -968,7 +1236,7 @@ def run_trading_flow(
     }
 
     result = app.invoke(initial, config=config)
-    return _format_result(result)
+    return dict(result)
 
 
 def _format_result(result: dict[str, Any]) -> str:
@@ -983,6 +1251,7 @@ def _format_result(result: dict[str, Any]) -> str:
     for key, label in [
         ("macro_output", "MACRO_SENTINEL"),
         ("orchestrator_output", "ORCHESTRATOR"),
+        ("candidate_selector_output", "CANDIDATE_SELECTOR"),
         ("screener_output", "FUNDAMENTAL_SCREENER"),
         ("quant_output", "OPTIONS_QUANT"),
         ("opportunity_output", "OPPORTUNITY_COST_ASSESSOR"),
@@ -999,6 +1268,11 @@ def _format_result(result: dict[str, Any]) -> str:
         if sections
         else "Graph completed with no captured outputs."
     )
+
+
+def format_trading_flow_state(result: dict[str, Any]) -> str:
+    """Public formatter for callers that need both state and report text."""
+    return _format_result(result)
 
 
 # ── CLI demo ───────────────────────────────────────────────────────────────
