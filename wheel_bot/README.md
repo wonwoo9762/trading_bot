@@ -23,7 +23,7 @@ uv run python scheduler.py --once --dry-run
 
 ```bash
 cd /Users/wonwoochoi/Desktop/trading_bot
-python3 -B -m unittest discover -s wheel_bot/tests
+wheel_bot/.venv/bin/python -B -m unittest discover -s wheel_bot/tests
 ```
 
 ## Daemon behavior
@@ -49,6 +49,63 @@ Candidate Selector is the node that looks at the candidate universe, local risk/
 ```env
 WHEEL_BOT_CANDIDATE_TICKERS=AAPL,MSFT,GOOGL
 ```
+
+### Current strategy policy
+
+The cash-secured-put entry is deterministic after the LLM narrows the candidate
+universe. The bot scans live put chains for every approved ticker and trades
+only when all of these checks pass:
+
+- Expiration is 7-45 calendar days away. There is no target DTE.
+- Eligible contracts are ranked by annualized premium after subtracting an
+  annualized half-spread cost and a near-expiration gamma penalty. Open interest
+  contributes only a small liquidity bonus.
+- Delta-proxy POP is 70-85%.
+- Gross annualized bid-premium yield on net cash collateral is 20-35%,
+  targeting 25%. This is a comparison metric, not a forecast or guarantee of
+  portfolio return.
+- Open interest is at least 100 and the bid/ask spread is at most 20% of the
+  midpoint.
+- Quantity is fully cash secured, one underlying is capped at 15% of NLV, and
+  total open CSP collateral is capped at 50% of NLV.
+- The bot will not start another CSP cycle in an underlying that already has an
+  open short put.
+
+The execution LLM cannot change the selected symbol or quantity. The broker
+adapter also verifies both fields and requires the submitted limit price to
+remain inside the approved bid/ask spread.
+
+### Position lifecycle
+
+Portfolio routing is deterministic; an LLM cannot route around positions that
+already exist.
+
+- An open short put routes to `SHORT_PUT_OPEN`, not back to a new CSP entry.
+- The bot buys back a short put when the current ask captures at least 50% of
+  the original credit.
+- Inside 3 DTE, it may buy back after capturing at least 20% to reduce
+  near-expiration gamma risk.
+- Losing, threatened, stale-quote, and incomplete-data short puts are held and
+  reported for manual review. They are not autonomously rolled or liquidated.
+- A covered call must be 7-45 DTE, 0.10-0.35 absolute delta, liquid, at least 2%
+  above spot, and at or above share cost basis. Existing short calls block a
+  duplicate covered call.
+- Repeated CRO rejection now ends in `NO_TRADE`/manual review. The graph never
+  forces liquidation after an LLM retry loop.
+
+The broker enforces the exact CRO-approved symbol, quantity, order side, and
+bid/ask bounds for CSP entries, covered calls, and short-put closes.
+
+The bundled candidate fundamentals/news are explicitly static seed data. Paper
+trading may use them for pipeline validation, but the broker blocks new live
+CSP orders until `fetch_candidate_universe()` and `fetch_fundamentals()` return
+a source beginning with `LIVE_` for the selected ticker
+(`candidate_data_live=true`).
+
+The long-run portfolio result will not equal the annualized premium screen.
+Assignment losses, missed fills, idle cash, underlying drawdowns, taxes, and
+management decisions all affect realized returns. A 20-30% annual portfolio
+return is not promised by this policy.
 
 ## Enable Alpaca order submission
 

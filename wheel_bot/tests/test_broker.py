@@ -53,6 +53,25 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(result.status, "BLOCKED")
         self.assertIn("LIVE_TRADING_NOT_ALLOWED", result.reason)
 
+    def test_live_csp_requires_live_candidate_data(self):
+        b = make_broker(paper=False)
+
+        result = b.execute(
+            json.dumps(
+                {
+                    "action": "SELL_CSP",
+                    "candidate_data_live": False,
+                    "candidate_data_source": "STATIC_SEED_NOT_LIVE",
+                }
+            ),
+            "{}",
+            human_approved=True,
+            allow_live_trading=True,
+        )
+
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertIn("LIVE_CANDIDATE_DATA_REQUIRED", result.reason)
+
     def test_simple_option_limit_order_is_submitted(self):
         client = FakeTradingClient()
         b = make_broker(client=client)
@@ -61,6 +80,10 @@ class BrokerTests(unittest.TestCase):
             json.dumps(
                 {
                     "action": "SELL_COVERED_CALL",
+                    "symbol": "AAPL260116C00170000",
+                    "qty": 1,
+                    "bid": 1.1,
+                    "ask": 1.3,
                     "portfolio_state": json.dumps({"ticker": "AAPL", "shares": 100}),
                 }
             ),
@@ -77,6 +100,59 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(order.side.value, "sell")
         self.assertEqual(order.time_in_force.value, "day")
         self.assertEqual(order.limit_price, 1.2)
+
+    def test_close_short_put_is_exact_and_buy_to_close(self):
+        client = FakeTradingClient()
+        b = make_broker(client=client)
+        ticket = {
+            "action": "CLOSE_SHORT_PUT",
+            "symbol": "AAPL270101P00300000",
+            "qty": 2,
+            "bid": 0.8,
+            "ask": 0.9,
+        }
+
+        result = b.execute(
+            json.dumps(ticket),
+            json.dumps(
+                {
+                    "symbol": ticket["symbol"],
+                    "side": "buy",
+                    "qty": 2,
+                    "limit_price": 0.85,
+                }
+            ),
+            human_approved=True,
+        )
+
+        self.assertEqual(result.status, "SUBMITTED")
+        self.assertEqual(client.orders[0].side.value, "buy")
+
+    def test_close_short_put_cannot_be_flipped_to_sell(self):
+        b = make_broker()
+        ticket = {
+            "action": "CLOSE_SHORT_PUT",
+            "symbol": "AAPL270101P00300000",
+            "qty": 1,
+            "bid": 0.8,
+            "ask": 0.9,
+        }
+
+        result = b.execute(
+            json.dumps(ticket),
+            json.dumps(
+                {
+                    "symbol": ticket["symbol"],
+                    "side": "sell",
+                    "qty": 1,
+                    "limit_price": 0.85,
+                }
+            ),
+            human_approved=True,
+        )
+
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertIn("side=buy", result.reason)
 
     def test_options_order_blocks_when_broker_returned_error(self):
         b = make_broker()
@@ -101,6 +177,85 @@ class BrokerTests(unittest.TestCase):
 
         self.assertEqual(result.status, "BLOCKED")
         self.assertIn("symbol", result.reason)
+
+    def test_csp_order_uses_exact_cro_approved_symbol_qty_and_spread(self):
+        client = FakeTradingClient()
+        b = make_broker(client=client)
+        ticket = {
+            "action": "SELL_CSP",
+            "symbol": "AAPL270101P00300000",
+            "qty": 4,
+            "bid": 2.0,
+            "ask": 2.2,
+        }
+
+        result = b.execute(
+            json.dumps(ticket),
+            json.dumps(
+                {
+                    "symbol": ticket["symbol"],
+                    "side": "sell",
+                    "qty": 4,
+                    "limit_price": 2.1,
+                }
+            ),
+            human_approved=True,
+        )
+
+        self.assertEqual(result.status, "SUBMITTED")
+        self.assertEqual(client.orders[0].qty, 4)
+
+    def test_csp_order_blocks_llm_resize_or_contract_substitution(self):
+        b = make_broker()
+        ticket = {
+            "action": "SELL_CSP",
+            "symbol": "AAPL270101P00300000",
+            "qty": 4,
+            "bid": 2.0,
+            "ask": 2.2,
+        }
+
+        result = b.execute(
+            json.dumps(ticket),
+            json.dumps(
+                {
+                    "symbol": "AAPL270101P00290000",
+                    "side": "sell",
+                    "qty": 1,
+                    "limit_price": 2.1,
+                }
+            ),
+            human_approved=True,
+        )
+
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertIn("changed the CRO-approved", result.reason)
+
+    def test_csp_order_blocks_price_outside_approved_spread(self):
+        b = make_broker()
+        ticket = {
+            "action": "SELL_CSP",
+            "symbol": "AAPL270101P00300000",
+            "qty": 2,
+            "bid": 2.0,
+            "ask": 2.2,
+        }
+
+        result = b.execute(
+            json.dumps(ticket),
+            json.dumps(
+                {
+                    "symbol": ticket["symbol"],
+                    "side": "sell",
+                    "qty": 2,
+                    "limit_price": 1.9,
+                }
+            ),
+            human_approved=True,
+        )
+
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertIn("outside the approved bid/ask", result.reason)
 
     def test_multi_leg_credit_order_is_submitted_with_negative_limit(self):
         client = FakeTradingClient()

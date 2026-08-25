@@ -21,7 +21,9 @@ class MacroSentinelOutput(BaseModel):
 class OrchestratorOutput(BaseModel):
     """Orchestrator routing directive."""
 
-    route_to: Literal["CASH", "ASSET_NOMINAL", "ASSET_DISTRESSED"]
+    route_to: Literal[
+        "CASH", "SHORT_PUT_OPEN", "ASSET_NOMINAL", "ASSET_DISTRESSED"
+    ]
     action: str = Field(description="Human-readable rationale for the route")
 
 
@@ -66,7 +68,7 @@ class QuantOutput(BaseModel):
 class AssessorOutput(BaseModel):
     """Opportunity Cost Assessor decision."""
 
-    decision: Literal["LIQUIDATE", "APPROVE_ROLL"]
+    decision: Literal["MANUAL_REVIEW", "APPROVE_ROLL"]
     reason: str
 
 

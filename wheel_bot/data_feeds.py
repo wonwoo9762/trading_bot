@@ -10,9 +10,15 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import date, datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+_OCC_OPTION_SYMBOL = re.compile(
+    r"^(?P<underlying>[A-Z]{1,6})(?P<expiration>\d{6})"
+    r"(?P<type>[CP])(?P<strike>\d{8})$"
+)
 
 
 def _get_trading_client():
@@ -40,31 +46,150 @@ def fetch_portfolio(ticker: str | None = None) -> str:
 
     positions = client.get_all_positions()
 
+    equity_positions = [
+        p for p in positions if _parse_occ_option_symbol(str(p.symbol)) is None
+    ]
+    short_puts = _short_put_exposures(positions)
+    short_calls = _short_call_exposures(positions)
+    short_put_collateral = sum(p["collateral"] for p in short_puts)
+
     target = None
     if ticker:
-        for p in positions:
+        for p in equity_positions:
             if p.symbol.upper() == ticker.upper():
                 target = p
                 break
-    elif positions:
-        target = max(positions, key=lambda p: abs(float(p.market_value)))
+    elif equity_positions:
+        target = max(
+            equity_positions, key=lambda p: abs(float(p.market_value))
+        )
+
+    lifecycle_ticker = ticker
+    if target is None and short_puts:
+        focused = [
+            item
+            for item in short_puts
+            if not ticker or str(item["underlying"]).upper() == ticker.upper()
+        ]
+        if focused:
+            lifecycle_ticker = str(
+                max(focused, key=lambda item: float(item["collateral"]))[
+                    "underlying"
+                ]
+            )
+
+    common = {
+        "cash": cash,
+        "nlv": float(account.portfolio_value),
+        "buying_power": float(account.buying_power),
+        "short_put_collateral": round(short_put_collateral, 2),
+        "short_puts": short_puts,
+        "short_calls": short_calls,
+    }
 
     if target is None:
-        return json.dumps({
-            "ticker": ticker or "NONE",
-            "spot": 0,
-            "cost_basis": 0,
-            "cash": cash,
-            "shares": 0,
-        })
+        return json.dumps(
+            {
+                "ticker": lifecycle_ticker or "NONE",
+                "spot": 0,
+                "cost_basis": 0,
+                "shares": 0,
+                **common,
+            }
+        )
 
-    return json.dumps({
-        "ticker": target.symbol,
-        "spot": float(target.current_price),
-        "cost_basis": float(target.avg_entry_price),
-        "cash": cash,
-        "shares": int(float(target.qty)),
-    })
+    return json.dumps(
+        {
+            "ticker": target.symbol,
+            "spot": float(target.current_price),
+            "cost_basis": float(target.avg_entry_price),
+            "shares": int(float(target.qty)),
+            **common,
+        }
+    )
+
+
+def _parse_occ_option_symbol(symbol: str) -> dict[str, object] | None:
+    match = _OCC_OPTION_SYMBOL.fullmatch(symbol.upper())
+    if not match:
+        return None
+    return {
+        "underlying": match.group("underlying"),
+        "expiration": match.group("expiration"),
+        "type": "put" if match.group("type") == "P" else "call",
+        "strike": int(match.group("strike")) / 1000,
+    }
+
+
+def _short_put_exposures(positions: list[object]) -> list[dict[str, object]]:
+    return _short_option_exposures(positions, option_type="put")
+
+
+def _short_call_exposures(positions: list[object]) -> list[dict[str, object]]:
+    return _short_option_exposures(positions, option_type="call")
+
+
+def _short_option_exposures(
+    positions: list[object], *, option_type: str
+) -> list[dict[str, object]]:
+    exposures: list[dict[str, object]] = []
+    for position in positions:
+        symbol = str(getattr(position, "symbol", "")).upper()
+        parsed = _parse_occ_option_symbol(symbol)
+        if parsed is None or parsed["type"] != option_type:
+            continue
+        try:
+            qty = int(float(getattr(position, "qty", 0)))
+        except (TypeError, ValueError):
+            continue
+        if qty >= 0:
+            continue
+        contracts = abs(qty)
+        strike = float(parsed["strike"])
+        raw_expiration = str(parsed["expiration"])
+        try:
+            expiration_date = datetime.strptime(raw_expiration, "%y%m%d").date()
+            expiration = expiration_date.isoformat()
+            dte = (expiration_date - date.today()).days
+        except ValueError:
+            expiration = raw_expiration
+            dte = None
+        entry_credit = _safe_float(getattr(position, "avg_entry_price", None))
+        current_price = _safe_float(getattr(position, "current_price", None))
+        market_value = _safe_float(getattr(position, "market_value", None))
+        unrealized_pl = _safe_float(getattr(position, "unrealized_pl", None))
+        if unrealized_pl is None and entry_credit is not None and current_price is not None:
+            unrealized_pl = (entry_credit - current_price) * 100 * contracts
+        profit_capture_pct = None
+        if entry_credit and current_price is not None:
+            profit_capture_pct = (entry_credit - current_price) / entry_credit * 100
+        exposures.append(
+            {
+                "symbol": symbol,
+                "underlying": parsed["underlying"],
+                "expiration": expiration,
+                "dte": dte,
+                "strike": strike,
+                "qty": contracts,
+                "entry_credit": entry_credit,
+                "current_price": current_price,
+                "market_value": market_value,
+                "unrealized_pl": (
+                    round(unrealized_pl, 2) if unrealized_pl is not None else None
+                ),
+                "profit_capture_pct": (
+                    round(profit_capture_pct, 2)
+                    if profit_capture_pct is not None
+                    else None
+                ),
+                "collateral": (
+                    round(strike * 100 * contracts, 2)
+                    if option_type == "put"
+                    else 0.0
+                ),
+            }
+        )
+    return exposures
 
 
 def summarize_portfolio_json_for_email(portfolio_json: str) -> str:
@@ -195,7 +320,7 @@ _STATIC_CANDIDATE_UNIVERSE: list[dict[str, object]] = [
     {
         "ticker": "AAPL",
         "fcf": 108_000_000_000,
-        "dte": 1.45,
+        "debt_to_equity": 1.45,
         "mkt_cap": 3_000_000_000_000,
         "liquidity": "Very liquid equity and options market.",
         "news": "No breaking company-specific risk in local seed data.",
@@ -204,7 +329,7 @@ _STATIC_CANDIDATE_UNIVERSE: list[dict[str, object]] = [
     {
         "ticker": "MSFT",
         "fcf": 74_000_000_000,
-        "dte": 0.45,
+        "debt_to_equity": 0.45,
         "mkt_cap": 3_000_000_000_000,
         "liquidity": "Very liquid equity and options market.",
         "news": "No breaking company-specific risk in local seed data.",
@@ -213,7 +338,7 @@ _STATIC_CANDIDATE_UNIVERSE: list[dict[str, object]] = [
     {
         "ticker": "GOOGL",
         "fcf": 69_000_000_000,
-        "dte": 0.10,
+        "debt_to_equity": 0.10,
         "mkt_cap": 2_000_000_000_000,
         "liquidity": "Liquid equity and options market.",
         "news": "No breaking company-specific risk in local seed data.",
@@ -222,7 +347,7 @@ _STATIC_CANDIDATE_UNIVERSE: list[dict[str, object]] = [
     {
         "ticker": "AMZN",
         "fcf": 36_000_000_000,
-        "dte": 0.80,
+        "debt_to_equity": 0.80,
         "mkt_cap": 1_800_000_000_000,
         "liquidity": "Liquid equity and options market.",
         "news": "No breaking company-specific risk in local seed data.",
@@ -231,7 +356,7 @@ _STATIC_CANDIDATE_UNIVERSE: list[dict[str, object]] = [
     {
         "ticker": "META",
         "fcf": 43_000_000_000,
-        "dte": 0.25,
+        "debt_to_equity": 0.25,
         "mkt_cap": 1_000_000_000_000,
         "liquidity": "Liquid equity and options market.",
         "news": "No breaking company-specific risk in local seed data.",
@@ -260,7 +385,7 @@ def fetch_candidate_universe(tickers: list[str] | None = None) -> str:
             or {
                 "ticker": t,
                 "fcf": None,
-                "dte": None,
+                "debt_to_equity": None,
                 "mkt_cap": None,
                 "liquidity": "UNKNOWN",
                 "news": "No local seed data; exclude unless external data is provided.",
@@ -284,7 +409,13 @@ def fetch_fundamentals(tickers: list[str] | None = None) -> str:
 
 # ── Options chain ──────────────────────────────────────────────────────────
 
-def fetch_options_chain(ticker: str, contract_type: str | None = None) -> str:
+def fetch_options_chain(
+    ticker: str,
+    contract_type: str | None = None,
+    *,
+    min_dte: int | None = None,
+    max_dte: int | None = None,
+) -> str:
     """Fetch the options chain for *ticker* from Alpaca.
 
     Requires an Alpaca subscription that includes options data.
@@ -303,12 +434,16 @@ def fetch_options_chain(ticker: str, contract_type: str | None = None) -> str:
         from alpaca.trading.requests import GetOptionContractsRequest
 
         today = date.today()
+        first_dte = 0 if min_dte is None else int(min_dte)
+        last_dte = 60 if max_dte is None else int(max_dte)
+        if first_dte < 0 or last_dte < first_dte:
+            raise ValueError("invalid option DTE range")
         req_kwargs = {
             "underlying_symbols": [ticker.upper()],
-            "expiration_date_gte": today.isoformat(),
-            "expiration_date_lte": (today + timedelta(days=60)).isoformat(),
+            "expiration_date_gte": (today + timedelta(days=first_dte)).isoformat(),
+            "expiration_date_lte": (today + timedelta(days=last_dte)).isoformat(),
             "status": "active",
-            "limit": 100,
+            "limit": 10000,
         }
         if contract_type:
             from alpaca.trading.enums import ContractType
@@ -319,12 +454,23 @@ def fetch_options_chain(ticker: str, contract_type: str | None = None) -> str:
         contracts = resp.option_contracts if resp else []
 
         if not contracts:
-            return f"OPTIONS_CHAIN_EMPTY: No active contracts for {ticker} within 60 days"
+            return (
+                f"OPTIONS_CHAIN_EMPTY: No active contracts for {ticker} "
+                f"between {first_dte} and {last_dte} DTE"
+            )
 
-        selected = contracts[:100]
+        selected = contracts
         symbols = [str(c.symbol) for c in selected]
         snapshots = _fetch_option_snapshots(symbols, k, s)
-        quotes = {} if snapshots else _fetch_option_latest_quotes(symbols, k, s)
+        symbols_without_quotes = [
+            symbol
+            for symbol in symbols
+            if _read_field(
+                snapshots.get(symbol), "latest_quote", "latestQuote"
+            )
+            is None
+        ]
+        quotes = _fetch_option_latest_quotes(symbols_without_quotes, k, s)
 
         lines: list[str] = []
         for c in selected:
@@ -346,6 +492,7 @@ def fetch_options_chain(ticker: str, contract_type: str | None = None) -> str:
             parts = [
                 f"[{str(contract_type).title()} {c.strike_price}",
                 f"Exp {c.expiration_date}",
+                f"Underlying: {ticker.upper()}",
                 f"Symbol: {symbol}",
             ]
             if bid is not None and ask is not None:
@@ -412,9 +559,15 @@ def _fetch_option_snapshots(
         from alpaca.data.requests import OptionSnapshotRequest
 
         data_client = OptionHistoricalDataClient(api_key, secret_key)
-        return data_client.get_option_snapshot(
-            OptionSnapshotRequest(symbol_or_symbols=symbols)
-        )
+        snapshots: dict[str, object] = {}
+        for offset in range(0, len(symbols), 100):
+            batch = symbols[offset : offset + 100]
+            response = data_client.get_option_snapshot(
+                OptionSnapshotRequest(symbol_or_symbols=batch)
+            )
+            if isinstance(response, dict):
+                snapshots.update(response)
+        return snapshots
     except ModuleNotFoundError as exc:
         logger.warning(
             "Option snapshot fetch failed: missing dependency '%s'. "
@@ -439,9 +592,15 @@ def _fetch_option_latest_quotes(
         from alpaca.data.requests import OptionLatestQuoteRequest
 
         data_client = OptionHistoricalDataClient(api_key, secret_key)
-        return data_client.get_option_latest_quote(
-            OptionLatestQuoteRequest(symbol_or_symbols=symbols)
-        )
+        quotes: dict[str, object] = {}
+        for offset in range(0, len(symbols), 100):
+            batch = symbols[offset : offset + 100]
+            response = data_client.get_option_latest_quote(
+                OptionLatestQuoteRequest(symbol_or_symbols=batch)
+            )
+            if isinstance(response, dict):
+                quotes.update(response)
+        return quotes
     except ModuleNotFoundError as exc:
         logger.warning(
             "Latest option quote fetch failed: missing dependency '%s'. "

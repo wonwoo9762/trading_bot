@@ -119,9 +119,29 @@ class WheelBroker:
 
         action = str(ticket.get("action", "")).upper()
 
+        if (
+            action == "SELL_CSP"
+            and not self._paper
+            and ticket.get("candidate_data_live") is not True
+        ):
+            return OrderResult(
+                status="BLOCKED",
+                reason=(
+                    "LIVE_CANDIDATE_DATA_REQUIRED. The current fundamental/news "
+                    "candidate source is static or unknown."
+                ),
+                ticket=ticket,
+            )
+
         if action == "LIQUIDATE":
             return self._liquidate(ticket)
-        if action in {"SELL_CSP", "SELL_COVERED_CALL", "ROLL", "SPREAD"}:
+        if action in {
+            "SELL_CSP",
+            "SELL_COVERED_CALL",
+            "CLOSE_SHORT_PUT",
+            "ROLL",
+            "SPREAD",
+        }:
             return self._place_options_order(ticket, execution_params)
         if action == "NO_TRADE":
             return OrderResult(
@@ -229,6 +249,48 @@ class WheelBroker:
                 reason="Simple option limit_price must be positive.",
                 ticket={"ticket": ticket, "execution_params": params},
             )
+
+        action = str(ticket.get("action") or "").upper()
+        if action in {"SELL_CSP", "SELL_COVERED_CALL", "CLOSE_SHORT_PUT"}:
+            approved_symbol = str(
+                ticket.get("symbol") or ticket.get("contract_symbol") or ""
+            )
+            try:
+                approved_qty = int(ticket.get("qty"))
+                bid = float(ticket.get("bid"))
+                ask = float(ticket.get("ask"))
+            except (TypeError, ValueError):
+                return OrderResult(
+                    status="BLOCKED",
+                    reason=(
+                        f"Approved {action} ticket is missing qty or bid/ask bounds."
+                    ),
+                    ticket={"ticket": ticket, "execution_params": params},
+                )
+            if symbol != approved_symbol or int(qty) != approved_qty:
+                return OrderResult(
+                    status="BLOCKED",
+                    reason=(
+                        f"Execution parameters changed the CRO-approved {action} "
+                        "symbol or quantity."
+                    ),
+                    ticket={"ticket": ticket, "execution_params": params},
+                )
+            if float(limit_price) < bid or float(limit_price) > ask:
+                return OrderResult(
+                    status="BLOCKED",
+                    reason=(
+                        f"{action} limit price is outside the approved bid/ask spread."
+                    ),
+                    ticket={"ticket": ticket, "execution_params": params},
+                )
+            expected_side = "buy" if action == "CLOSE_SHORT_PUT" else "sell"
+            if str(side) != expected_side:
+                return OrderResult(
+                    status="BLOCKED",
+                    reason=f"{action} must use side={expected_side}.",
+                    ticket={"ticket": ticket, "execution_params": params},
+                )
 
         try:
             from alpaca.trading.enums import OrderSide, TimeInForce
@@ -366,6 +428,8 @@ class WheelBroker:
         action = str(ticket.get("action", "")).upper()
         if action in {"SELL_CSP", "SELL_COVERED_CALL"}:
             return "sell"
+        if action == "CLOSE_SHORT_PUT":
+            return "buy"
         return ""
 
     def _resolve_option_qty(

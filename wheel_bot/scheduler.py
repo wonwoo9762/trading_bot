@@ -328,11 +328,15 @@ def run_wheel(
         fundamentals = candidate_universe or "[]"
 
     try:
-        chain = (
-            fetch_options_chain(resolved_ticker)
-            if resolved_ticker != "NONE"
-            else ""
-        )
+        short_put_tickers = {
+            str(item.get("underlying") or "").upper()
+            for item in (pf.get("short_puts") or [])
+            if isinstance(item, dict) and item.get("underlying")
+        }
+        chain_tickers = sorted(short_put_tickers)
+        if not chain_tickers and resolved_ticker != "NONE":
+            chain_tickers = [resolved_ticker]
+        chain = "\n".join(fetch_options_chain(symbol) for symbol in chain_tickers)
     except Exception:
         logger.exception("Failed to fetch options chain")
         chain = ""
@@ -547,8 +551,8 @@ def main() -> None:
         )
 
     logger.info(
-        "Scheduler started.  Next run: %s",
-        scheduler.get_jobs()[0].next_run_time,
+        "Scheduler starting with %d configured job(s).",
+        len(scheduler.get_jobs()),
     )
     scheduler.start()
 

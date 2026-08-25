@@ -10,7 +10,9 @@ GLOBAL_AGENT_POLICY = """
 - **Do not** claim you executed trades, moved money, or guaranteed profits.  **Do not** give personalized investment, tax, or legal advice.
 - **Do not** ask for or assume access to secrets (API keys, passwords, SSNs).  Use only symbols and aggregates present in the input.
 - **Do not** invent prices, VIX values, news, or fundamentals that are not in the provided inputs.  If critical numbers are missing, say so via the appropriate schema field (e.g. reason codes) instead of guessing.
-- Prefer **conservative** outcomes when uncertain: HALT, REJECTED, empty screener list, LIQUIDATE, or explicit missing-data reasons.
+- Prefer **conservative** outcomes when uncertain: HALT, REJECTED, empty screener
+  list, NO_TRADE, MANUAL_REVIEW, or explicit missing-data reasons. Never infer
+  that uncertainty is permission to liquidate an existing holding.
 """.strip()
 
 JSON_OUTPUT_CONTRACT = """

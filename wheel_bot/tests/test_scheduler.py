@@ -14,6 +14,32 @@ import scheduler
 
 
 class SchedulerTests(unittest.TestCase):
+    def test_scheduler_starts_without_reading_uninitialized_next_run_time(self):
+        class JobWithoutNextRunTime:
+            pass
+
+        class FakeScheduler:
+            def __init__(self, timezone=None):
+                self.jobs = []
+
+            def add_job(self, *args, **kwargs):
+                self.jobs.append(JobWithoutNextRunTime())
+
+            def get_jobs(self):
+                return self.jobs
+
+            def start(self):
+                self.started = True
+
+            def shutdown(self, wait=False):
+                pass
+
+        with mock.patch.object(sys, "argv", ["scheduler.py", "--no-afternoon"]):
+            with mock.patch.object(scheduler, "_setup_logging"):
+                with mock.patch.object(scheduler, "BlockingScheduler", FakeScheduler):
+                    with mock.patch.object(scheduler.signal, "signal"):
+                        scheduler.main()
+
     def test_transaction_summary_for_submitted_order(self):
         summary = scheduler._build_transaction_summary(
             graph_state={
@@ -127,6 +153,39 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(len(sent), 1)
         self.assertIn("DRY_RUN", sent[0][0])
         self.assertIn("Dry run requested", sent[0][1]["transaction_summary"]["why"])
+
+    def test_option_only_account_fetches_each_short_put_chain(self):
+        portfolio = json.dumps(
+            {
+                "ticker": "AAPL",
+                "cash": 50000,
+                "nlv": 100000,
+                "shares": 0,
+                "spot": 0,
+                "cost_basis": 0,
+                "short_puts": [
+                    {"underlying": "MSFT", "qty": 1},
+                    {"underlying": "AAPL", "qty": 1},
+                ],
+            }
+        )
+        with mock.patch.object(scheduler, "is_market_day", return_value=True):
+            with mock.patch.object(scheduler, "fetch_portfolio", return_value=portfolio):
+                with mock.patch.object(scheduler, "fetch_macro", return_value="VIX clear"):
+                    with mock.patch.object(scheduler, "fetch_fundamentals", return_value="[]"):
+                        with mock.patch.object(
+                            scheduler,
+                            "fetch_options_chain",
+                            side_effect=lambda ticker: f"[{ticker} chain]",
+                        ) as fetch_chain:
+                            with mock.patch.object(scheduler, "fetch_account_summary", return_value={}):
+                                with mock.patch.object(scheduler, "send_run_report", return_value=True):
+                                    scheduler.run_wheel(dry_run=True, run_label="manual")
+
+        self.assertEqual(
+            [call.args[0] for call in fetch_chain.call_args_list],
+            ["AAPL", "MSFT"],
+        )
 
     def test_run_wheel_success_email_explains_submitted_transaction(self):
         sent = []

@@ -1,0 +1,14 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local secrets/config
+.cursor/mcp.json
+wheel_bot/.env
+wheel_bot/.env.example
+
+# Runtime artifacts
+wheel_bot/.venv/
+wheel_bot/logs/*
+!wheel_bot/logs/.gitkeep
+wheel_bot/data/

@@ -92,6 +92,64 @@ class DataFeedTests(unittest.TestCase):
         self.assertEqual(payload["shares"], 0)
         self.assertEqual(payload["spot"], 0)
 
+    def test_fetch_portfolio_tracks_short_put_without_treating_it_as_stock(self):
+        client = FakeClient(
+            positions=[
+                types.SimpleNamespace(
+                    symbol="AAPL260826P00307500",
+                    market_value="-75",
+                    current_price="0.75",
+                    avg_entry_price="0.76",
+                    qty="-1",
+                )
+            ],
+            account=types.SimpleNamespace(
+                cash="1000075",
+                buying_power="3000000",
+                portfolio_value="1000000",
+                equity="1000000",
+            ),
+        )
+
+        with mock.patch.object(data_feeds, "_get_trading_client", return_value=client):
+            payload = json.loads(data_feeds.fetch_portfolio())
+
+        self.assertEqual(payload["ticker"], "AAPL")
+        self.assertEqual(payload["shares"], 0)
+        self.assertEqual(payload["nlv"], 1000000)
+        self.assertEqual(payload["short_put_collateral"], 30750)
+        self.assertEqual(payload["short_puts"][0]["underlying"], "AAPL")
+        self.assertEqual(payload["short_puts"][0]["entry_credit"], 0.76)
+        self.assertEqual(payload["short_puts"][0]["current_price"], 0.75)
+        self.assertIn("dte", payload["short_puts"][0])
+
+    def test_fetch_portfolio_tracks_short_call_for_duplicate_protection(self):
+        client = FakeClient(
+            positions=[
+                types.SimpleNamespace(
+                    symbol="AAPL",
+                    market_value="10000",
+                    current_price="100",
+                    avg_entry_price="95",
+                    qty="100",
+                ),
+                types.SimpleNamespace(
+                    symbol="AAPL260930C00105000",
+                    market_value="-100",
+                    current_price="1.00",
+                    avg_entry_price="1.50",
+                    qty="-1",
+                ),
+            ]
+        )
+
+        with mock.patch.object(data_feeds, "_get_trading_client", return_value=client):
+            payload = json.loads(data_feeds.fetch_portfolio())
+
+        self.assertEqual(payload["ticker"], "AAPL")
+        self.assertEqual(payload["short_calls"][0]["underlying"], "AAPL")
+        self.assertEqual(payload["short_calls"][0]["qty"], 1)
+
     def test_fetch_account_summary_success_and_failure(self):
         position = types.SimpleNamespace(
             symbol="AAPL",
@@ -143,8 +201,10 @@ class DataFeedTests(unittest.TestCase):
             chain = data_feeds.fetch_options_chain("AAPL")
 
         self.assertIn("Symbol: AAPL260116C00170000", chain)
+        self.assertIn("Underlying: AAPL", chain)
         self.assertIn("Bid: 1.1", chain)
         self.assertIn("Ask: 1.2", chain)
+        self.assertEqual(client.contract_request.limit, 10000)
 
     def test_fetch_options_chain_includes_snapshot_delta_and_pop(self):
         install_alpaca_stubs(
@@ -170,9 +230,19 @@ class DataFeedTests(unittest.TestCase):
         fake_config.get_alpaca_credentials = lambda: ("key", "secret")
         fake_config.get_alpaca_trading_client = lambda: client
         with mock.patch.dict(sys.modules, {"config": fake_config}):
-            chain = data_feeds.fetch_options_chain("AAPL", contract_type="put")
+            chain = data_feeds.fetch_options_chain(
+                "AAPL", contract_type="put", min_dte=10, max_dte=18
+            )
 
         self.assertEqual(client.contract_request.type.value, "put")
+        self.assertEqual(
+            client.contract_request.expiration_date_gte,
+            (data_feeds.date.today() + data_feeds.timedelta(days=10)).isoformat(),
+        )
+        self.assertEqual(
+            client.contract_request.expiration_date_lte,
+            (data_feeds.date.today() + data_feeds.timedelta(days=18)).isoformat(),
+        )
         self.assertIn("Delta: -0.2500", chain)
         self.assertIn("POP: 75.0%", chain)
         self.assertIn("IV: 0.3200", chain)
