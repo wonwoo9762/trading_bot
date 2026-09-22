@@ -26,13 +26,26 @@ cd /Users/wonwoochoi/Desktop/trading_bot
 wheel_bot/.venv/bin/python -B -m unittest discover -s wheel_bot/tests
 ```
 
+On Windows, from the repository root:
+
+```powershell
+& .\wheel_bot\.venv\Scripts\python.exe -B -m unittest discover -s wheel_bot/tests
+```
+
+Install the locked project dependencies first. The suite includes a subprocess
+that uses real LangGraph and Alpaca request models with all network connections
+blocked. Its market data, agent responses, and broker transport are fixtures.
+
 ## Daemon behavior
 
 The LaunchAgent now runs through `uv` and passes `--run-on-start`, so loading it creates/uses the project environment, triggers one immediate run, and then keeps the normal 09:45 and 15:30 ET schedule.
 
 ## Email behavior
 
-Every scheduler trigger sends a report when SMTP is configured. If no order was submitted, the email says "No transaction made" and gives the skip, failure, gate, CRO, or broker reason. If an order was submitted, the email says "Transaction made" and includes the action, symbol, order ID, CRO approval reason, and broker submission reason.
+Every scheduler trigger sends a report when SMTP is configured. Reports distinguish
+"No new order submitted", "Order submitted; fill not confirmed", an existing order
+found during reconciliation, and an uncertain submission. Order IDs and client
+order IDs are included when available. Submission alone is not fill confirmation.
 
 ## CASH path
 
@@ -49,6 +62,9 @@ Candidate Selector is the node that looks at the candidate universe, local risk/
 ```env
 WHEEL_BOT_CANDIDATE_TICKERS=AAPL,MSFT,GOOGL
 ```
+
+An empty or failed candidate selection ends in `NO_TRADE`. The screener cannot
+reintroduce excluded candidates, and neither agent may expand the supplied universe.
 
 ### Current strategy policy
 
@@ -71,9 +87,15 @@ only when all of these checks pass:
 - The bot will not start another CSP cycle in an underlying that already has an
   open short put.
 
-The execution LLM cannot change the selected symbol or quantity. The broker
-adapter also verifies both fields and requires the submitted limit price to
-remain inside the approved bid/ask spread.
+Execution parameters are constructed by code after CRO approval. Code copies
+the selected contract and whole-contract quantity, sets explicit `sell_to_open`
+or `buy_to_close` intent, and uses a midpoint rounded to cents within the approved
+bid/ask spread. It never submits a market order or automatically reprices an
+unfilled order. The broker independently rejects changed symbols, quantities,
+sides, intent, added legs, invalid numbers, and out-of-bounds prices.
+
+Quotes are still the approved ticket's snapshot: this does not yet verify freshness,
+contract-specific tick increments, or refresh collateral and positions at submission.
 
 ### Position lifecycle
 
@@ -92,6 +114,10 @@ already exist.
   duplicate covered call.
 - Repeated CRO rejection now ends in `NO_TRADE`/manual review. The graph never
   forces liquidation after an LLM retry loop.
+- Automated `ROLL` and `SPREAD` orders are disabled at the strategy, validator,
+  scheduler, and broker boundaries. Quant/assessor suggestions remain visible
+  for manual review until every leg, position, collateral, and maximum loss can
+  be validated. The scheduler cannot submit liquidation orders.
 
 The broker enforces the exact CRO-approved symbol, quantity, order side, and
 bid/ask bounds for CSP entries, covered calls, and short-put closes.
@@ -106,6 +132,38 @@ The long-run portfolio result will not equal the annualized premium screen.
 Assignment losses, missed fills, idle cash, underlying drawdowns, taxes, and
 management decisions all affect realized returns. A 20-30% annual portfolio
 return is not promised by this policy.
+
+## Duplicate orders and uncertain submissions
+
+The broker uses a persistent SQLite journal at `wheel_bot/data/order_journal.sqlite3`.
+Each account/environment/action/contract gets one stable client order ID per
+Eastern trading date. Changing quantity or price does not create another attempt.
+An attempted contract/action cannot be automatically retried that day, even after
+cancellation, rejection, or a fill. A new Eastern date permits a new intent only
+after previous unresolved submissions have been reconciled.
+
+Before submitting, the broker checks the account identity, reconciles unresolved
+journal entries by client order ID, checks for an existing matching broker order,
+and requires the account's open-order list to be empty. This conservative gate
+includes manual orders, partial fills, pending cancellations, and orders in other
+symbols. It also applies to automated closes; urgent conflicts need manual review.
+Pending collateral and share coverage are not yet allocated across concurrent trades.
+
+A reservation is committed before submission. Workers using the same journal
+cannot both reserve while an earlier submission is unresolved. API lookup errors,
+invalid responses, or journal failures block submission. Only HTTP 404 is treated
+as an absent broker order; it never clears a previously reserved, uncertain attempt.
+
+After a submission exception, the broker looks up the same client ID without
+resubmitting. It reports `RECONCILED` if the broker order is found or `UNKNOWN`
+otherwise. An unresolved record survives restarts and date changes. Later attempts
+can reconcile an order that becomes visible and terminal. If Alpaca never shows
+the order, manual investigation is required; there is intentionally no automatic
+timeout that forgets the reservation. Do not delete the journal to bypass this gate.
+
+Keep one deployment per account and preserve this journal across restarts. Separate
+hosts/journals and concurrent manual account changes are not covered by the local
+reservation lock. These safeguards do not replace complete portfolio reconciliation.
 
 ## Enable Alpaca order submission
 

@@ -84,6 +84,18 @@ def install_alpaca_stubs(
     historical = types.ModuleType("alpaca.data.historical")
     option_mod = types.ModuleType("alpaca.data.historical.option")
     data_requests = types.ModuleType("alpaca.data.requests")
+    common = types.ModuleType("alpaca.common")
+    exceptions = types.ModuleType("alpaca.common.exceptions")
+
+    class APIError(Exception):
+        def __init__(self, error, http_error=None):
+            super().__init__(error)
+            self.status_code = http_error.response.status_code if http_error else None
+
+    exceptions.APIError = APIError
+
+    class QueryOrderStatus(str, enum.Enum):
+        OPEN = "open"
 
     class OrderSide(str, enum.Enum):
         BUY = "buy"
@@ -157,7 +169,9 @@ def install_alpaca_stubs(
     enums.OrderClass = OrderClass
     enums.ContractType = ContractType
     enums.PositionIntent = PositionIntent
+    enums.QueryOrderStatus = QueryOrderStatus
     requests.LimitOrderRequest = LimitOrderRequest
+    requests.GetOrdersRequest = LimitOrderRequest
     requests.OptionLegRequest = OptionLegRequest
     requests.GetOptionContractsRequest = GetOptionContractsRequest
     client_mod.TradingClient = TradingClient
@@ -168,6 +182,8 @@ def install_alpaca_stubs(
     sys.modules.update(
         {
             "alpaca": alpaca,
+            "alpaca.common": common,
+            "alpaca.common.exceptions": exceptions,
             "alpaca.trading": trading,
             "alpaca.trading.enums": enums,
             "alpaca.trading.requests": requests,

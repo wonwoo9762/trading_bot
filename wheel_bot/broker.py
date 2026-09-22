@@ -10,7 +10,9 @@ import json
 import logging
 from dataclasses import dataclass, field
 from typing import Any
-from uuid import uuid4
+
+from execution_guard import DEFAULT_JOURNAL_PATH, ExecutionGuard, lookup_order
+from order_policy import ApprovedOptionOrder, REPAIR_DISABLED_REASON
 
 logger = logging.getLogger(__name__)
 
@@ -19,8 +21,9 @@ logger = logging.getLogger(__name__)
 class OrderResult:
     """Immutable, serialisable record of an order attempt."""
 
-    status: str  # SUBMITTED | DRY_RUN | BLOCKED | FAILED
+    status: str  # SUBMITTED | RECONCILED | UNKNOWN | DRY_RUN | BLOCKED | FAILED
     order_id: str | None = None
+    client_order_id: str | None = None
     reason: str = ""
     ticket: dict[str, Any] = field(default_factory=dict)
 
@@ -28,6 +31,7 @@ class OrderResult:
         return {
             "status": self.status,
             "order_id": self.order_id,
+            "client_order_id": self.client_order_id,
             "reason": self.reason,
             "ticket": self.ticket,
         }
@@ -117,6 +121,9 @@ class WheelBroker:
                 status="FAILED", reason=f"Invalid ticket JSON: {exc}"
             )
 
+        if not isinstance(ticket, dict):
+            return OrderResult(status="BLOCKED", reason="Approved ticket must be a JSON object")
+
         action = str(ticket.get("action", "")).upper()
 
         if (
@@ -135,12 +142,12 @@ class WheelBroker:
 
         if action == "LIQUIDATE":
             return self._liquidate(ticket)
+        if action in {"ROLL", "SPREAD"}:
+            return OrderResult(status="BLOCKED", reason=REPAIR_DISABLED_REASON, ticket=ticket)
         if action in {
             "SELL_CSP",
             "SELL_COVERED_CALL",
             "CLOSE_SHORT_PUT",
-            "ROLL",
-            "SPREAD",
         }:
             return self._place_options_order(ticket, execution_params)
         if action == "NO_TRADE":
@@ -206,266 +213,82 @@ class WheelBroker:
             )
 
         if not isinstance(params, dict):
-            return OrderResult(
-                status="FAILED",
-                reason="Execution params must be a JSON object",
-                ticket=ticket,
-            )
-
+            return OrderResult(status="BLOCKED", reason="Execution params must be a JSON object", ticket=ticket)
         if params.get("error"):
-            return OrderResult(
-                status="BLOCKED",
-                reason=f"Execution broker returned error: {params.get('error')}",
-                ticket={"ticket": ticket, "execution_params": params},
-            )
-
-        if params.get("legs"):
-            return self._place_multi_leg_options_order(ticket, params)
-
-        symbol = self._resolve_option_symbol(ticket, params)
-        side = self._resolve_option_side(ticket, params)
-        qty = self._resolve_option_qty(ticket, params)
-        limit_price = self._resolve_limit_price(params)
-
-        missing = [
-            name
-            for name, value in {
-                "symbol": symbol,
-                "side": side,
-                "qty": qty,
-                "limit_price": limit_price,
-            }.items()
-            if value in (None, "", 0)
-        ]
-        if missing:
-            return OrderResult(
-                status="BLOCKED",
-                reason=f"Missing executable option order fields: {', '.join(missing)}",
-                ticket={"ticket": ticket, "execution_params": params},
-            )
-        if float(limit_price) <= 0:
-            return OrderResult(
-                status="BLOCKED",
-                reason="Simple option limit_price must be positive.",
-                ticket={"ticket": ticket, "execution_params": params},
-            )
-
-        action = str(ticket.get("action") or "").upper()
-        if action in {"SELL_CSP", "SELL_COVERED_CALL", "CLOSE_SHORT_PUT"}:
-            approved_symbol = str(
-                ticket.get("symbol") or ticket.get("contract_symbol") or ""
-            )
-            try:
-                approved_qty = int(ticket.get("qty"))
-                bid = float(ticket.get("bid"))
-                ask = float(ticket.get("ask"))
-            except (TypeError, ValueError):
-                return OrderResult(
-                    status="BLOCKED",
-                    reason=(
-                        f"Approved {action} ticket is missing qty or bid/ask bounds."
-                    ),
-                    ticket={"ticket": ticket, "execution_params": params},
-                )
-            if symbol != approved_symbol or int(qty) != approved_qty:
-                return OrderResult(
-                    status="BLOCKED",
-                    reason=(
-                        f"Execution parameters changed the CRO-approved {action} "
-                        "symbol or quantity."
-                    ),
-                    ticket={"ticket": ticket, "execution_params": params},
-                )
-            if float(limit_price) < bid or float(limit_price) > ask:
-                return OrderResult(
-                    status="BLOCKED",
-                    reason=(
-                        f"{action} limit price is outside the approved bid/ask spread."
-                    ),
-                    ticket={"ticket": ticket, "execution_params": params},
-                )
-            expected_side = "buy" if action == "CLOSE_SHORT_PUT" else "sell"
-            if str(side) != expected_side:
-                return OrderResult(
-                    status="BLOCKED",
-                    reason=f"{action} must use side={expected_side}.",
-                    ticket={"ticket": ticket, "execution_params": params},
-                )
+            return OrderResult(status="BLOCKED", reason=f"Execution broker returned error: {params['error']}", ticket=ticket)
 
         try:
-            from alpaca.trading.enums import OrderSide, TimeInForce
+            approved = ApprovedOptionOrder.from_ticket(ticket)
+            limit_price = approved.validate_execution(params)
+        except ValueError as exc:
+            return OrderResult(
+                status="BLOCKED",
+                reason=str(exc),
+                ticket={"ticket": ticket, "execution_params": params},
+            )
+
+        guard = ExecutionGuard(getattr(self, "_journal_path", DEFAULT_JOURNAL_PATH))
+        try:
+            from alpaca.trading.enums import OrderSide, PositionIntent, TimeInForce
             from alpaca.trading.requests import LimitOrderRequest
 
+            # Identity and quantity always come from the approved ticket.
             order_data = LimitOrderRequest(
-                symbol=str(symbol),
-                qty=int(qty),
-                side=OrderSide(str(side)),
+                symbol=approved.symbol,
+                qty=approved.qty,
+                side=OrderSide(approved.side),
+                position_intent=PositionIntent(approved.position_intent),
                 time_in_force=TimeInForce.DAY,
                 limit_price=float(limit_price),
-                client_order_id=self._client_order_id(),
             )
+            client_id = guard.reserve(
+                self._client, paper=self._paper, approved=approved, limit_price=limit_price
+            )
+            order_data.client_order_id = client_id
+        except Exception as exc:
+            return OrderResult(status="BLOCKED", reason=f"EXECUTION_PREFLIGHT: {exc}", ticket=ticket)
+
+        try:
             submitted = self._client.submit_order(order_data=order_data)
+            guard.record(client_id, submitted)
             order_id = self._extract_order_id(submitted)
             logger.info(
                 "Submitted option order %s %s x%s @ %s (paper=%s)",
-                side,
-                symbol,
-                qty,
+                approved.side,
+                approved.symbol,
+                approved.qty,
                 limit_price,
                 self._paper,
             )
             return OrderResult(
                 status="SUBMITTED",
                 order_id=order_id,
-                reason="Option limit order submitted.",
+                client_order_id=client_id,
+                reason="Option limit order submitted; fill not confirmed.",
                 ticket={"ticket": ticket, "execution_params": params},
             )
         except Exception as exc:
-            logger.exception("Option order submission failed")
-            return OrderResult(
-                status="FAILED",
-                reason=str(exc),
-                ticket={"ticket": ticket, "execution_params": params},
-            )
-
-    def _place_multi_leg_options_order(
-        self, ticket: dict[str, Any], params: dict[str, Any]
-    ) -> OrderResult:
-        legs_payload = params.get("legs")
-        if not isinstance(legs_payload, list) or len(legs_payload) < 2:
-            return OrderResult(
-                status="BLOCKED",
-                reason="Multi-leg option order requires at least two legs.",
-                ticket={"ticket": ticket, "execution_params": params},
-            )
-
-        qty = self._resolve_option_qty(ticket, params)
-        limit_price = self._resolve_limit_price(params)
-        if qty is None or limit_price is None:
-            return OrderResult(
-                status="BLOCKED",
-                reason="Multi-leg option order missing qty or limit_price.",
-                ticket={"ticket": ticket, "execution_params": params},
-            )
-
-        action = str(ticket.get("action", "")).upper()
-        if action in {"ROLL", "SPREAD"} and limit_price > 0:
-            limit_price = -abs(limit_price)
-
-        try:
-            from alpaca.trading.enums import (
-                OrderClass,
-                OrderSide,
-                PositionIntent,
-                TimeInForce,
-            )
-            from alpaca.trading.requests import LimitOrderRequest, OptionLegRequest
-
-            legs = []
-            for leg in legs_payload:
-                if not isinstance(leg, dict) or not leg.get("symbol"):
-                    raise ValueError("Each leg must include an option symbol")
-                side_value = leg.get("side")
-                intent_value = leg.get("position_intent")
-                legs.append(
-                    OptionLegRequest(
-                        symbol=str(leg["symbol"]),
-                        ratio_qty=float(leg.get("ratio_qty") or 1),
-                        side=OrderSide(str(side_value)) if side_value else None,
-                        position_intent=(
-                            PositionIntent(str(intent_value))
-                            if intent_value
-                            else None
-                        ),
+            # A timeout can occur after Alpaca accepted the order. Look it up
+            # with the same ID; never mint another ID or submit again here.
+            try:
+                existing = lookup_order(self._client, client_id)
+                if existing is not None:
+                    guard.record(client_id, existing)
+                    return OrderResult(
+                        status="RECONCILED", order_id=self._extract_order_id(existing),
+                        client_order_id=client_id,
+                        reason="Submission response failed, but Alpaca has this order. No resubmission made; inspect its broker status.",
+                        ticket={"ticket": ticket, "execution_params": params},
                     )
-                )
-
-            order_data = LimitOrderRequest(
-                qty=int(qty),
-                order_class=OrderClass.MLEG,
-                legs=legs,
-                time_in_force=TimeInForce.DAY,
-                limit_price=float(limit_price),
-                client_order_id=self._client_order_id(),
-            )
-            submitted = self._client.submit_order(order_data=order_data)
-            order_id = self._extract_order_id(submitted)
-            logger.info(
-                "Submitted multi-leg option order x%s @ %s (paper=%s)",
-                qty,
-                limit_price,
-                self._paper,
-            )
+            except Exception:
+                logger.exception("Unable to reconcile option submission")
+            logger.warning("Option submission outcome uncertain: %s", client_id)
             return OrderResult(
-                status="SUBMITTED",
-                order_id=order_id,
-                reason="Multi-leg option limit order submitted.",
+                status="UNKNOWN",
+                client_order_id=client_id,
+                reason=f"Submission outcome uncertain: {exc}. Reservation retained; reconcile before retrying.",
                 ticket={"ticket": ticket, "execution_params": params},
             )
-        except Exception as exc:
-            logger.exception("Multi-leg option order submission failed")
-            return OrderResult(
-                status="FAILED",
-                reason=str(exc),
-                ticket={"ticket": ticket, "execution_params": params},
-            )
-
-    def _resolve_option_symbol(
-        self, ticket: dict[str, Any], params: dict[str, Any]
-    ) -> str:
-        for key in ("symbol", "option_symbol", "contract_symbol"):
-            value = params.get(key) or ticket.get(key)
-            if value:
-                return str(value)
-        return ""
-
-    def _resolve_option_side(
-        self, ticket: dict[str, Any], params: dict[str, Any]
-    ) -> str:
-        side = str(params.get("side") or ticket.get("side") or "").strip().lower()
-        if side in {"buy", "sell"}:
-            return side
-        action = str(ticket.get("action", "")).upper()
-        if action in {"SELL_CSP", "SELL_COVERED_CALL"}:
-            return "sell"
-        if action == "CLOSE_SHORT_PUT":
-            return "buy"
-        return ""
-
-    def _resolve_option_qty(
-        self, ticket: dict[str, Any], params: dict[str, Any]
-    ) -> int | None:
-        raw_qty = params.get("qty") or params.get("quantity") or ticket.get("qty")
-        if raw_qty is None:
-            raw_portfolio = ticket.get("portfolio_state")
-            if isinstance(raw_portfolio, str):
-                try:
-                    raw_portfolio = json.loads(raw_portfolio)
-                except Exception:
-                    raw_portfolio = None
-            if isinstance(raw_portfolio, dict):
-                shares = int(float(raw_portfolio.get("shares") or 0))
-                if shares >= 100:
-                    return max(1, shares // 100)
-            return 1
-        try:
-            qty = int(float(raw_qty))
-        except (TypeError, ValueError):
-            return None
-        return qty if qty > 0 else None
-
-    def _resolve_limit_price(self, params: dict[str, Any]) -> float | None:
-        raw = params.get("limit_price")
-        if raw is None:
-            raw = params.get("initial_limit")
-        try:
-            price = float(raw)
-        except (TypeError, ValueError):
-            return None
-        return price if price != 0 else None
-
-    def _client_order_id(self) -> str:
-        return f"wheelbot-{uuid4().hex[:24]}"
 
     def _extract_order_id(self, submitted: Any) -> str | None:
         if isinstance(submitted, dict):

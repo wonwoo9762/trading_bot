@@ -36,6 +36,7 @@ from pydantic import BaseModel
 
 from config import require_openai_key
 from guardrails import build_agent_system, human_payload_suspicious
+from order_policy import ApprovedOptionOrder, REPAIR_DISABLED_REASON
 from models import (
     AssessorOutput,
     BrokerOutput,
@@ -49,7 +50,6 @@ from models import (
 from prompts import (
     CANDIDATE_SELECTOR_PROMPT,
     CHIEF_RISK_OFFICER_PROMPT,
-    EXECUTION_BROKER_PROMPT,
     FUNDAMENTAL_SCREENER_PROMPT,
     MACRO_SENTINEL_PROMPT,
     OPPORTUNITY_COST_ASSESSOR_PROMPT,
@@ -750,11 +750,9 @@ def _load_json_list(raw: str) -> list[dict[str, Any]]:
 
 
 def _filter_json_rows_by_tickers(raw: str, tickers: list[str]) -> str:
-    wanted = {t.upper() for t in tickers}
+    wanted = {t.strip().upper() for t in tickers}
     rows = _load_json_list(raw)
-    if not rows or not wanted:
-        return raw
-    filtered = [row for row in rows if str(row.get("ticker", "")).upper() in wanted]
+    filtered = [row for row in rows if str(row.get("ticker", "")).strip().upper() in wanted]
     return json.dumps(filtered)
 
 
@@ -763,36 +761,6 @@ def _candidate_data_source(raw: str, ticker: str) -> str:
         if str(row.get("ticker") or "").upper() == ticker.upper():
             return str(row.get("source") or "UNKNOWN")
     return "UNKNOWN"
-
-
-def _deterministic_candidate_fallback(raw: str) -> CandidateSelectorOutput:
-    rows = _load_json_list(raw)
-    selected: list[str] = []
-    for row in rows:
-        try:
-            ticker = str(row.get("ticker", "")).upper()
-            fcf = float(row.get("fcf") or 0)
-            debt_to_equity = float(
-                row.get("debt_to_equity")
-                if row.get("debt_to_equity") is not None
-                else row.get("dte") or 999
-            )
-            mkt_cap = float(row.get("mkt_cap") or 0)
-        except (TypeError, ValueError):
-            continue
-        if (
-            ticker
-            and fcf > 0
-            and debt_to_equity < 1.5
-            and mkt_cap > 50_000_000_000
-        ):
-            selected.append(ticker)
-        if len(selected) >= 5:
-            break
-    return CandidateSelectorOutput(
-        selected_tickers=selected,
-        reason="DETERMINISTIC_FALLBACK_STATIC_UNIVERSE",
-    )
 
 
 def candidate_selector_node(state: WheelState) -> WheelState:
@@ -812,7 +780,14 @@ def candidate_selector_node(state: WheelState) -> WheelState:
         human,
     )
     if parsed is None:
-        parsed = _deterministic_candidate_fallback(universe)
+        parsed = CandidateSelectorOutput(
+            selected_tickers=[], reason="LLM_FAILURE_FAIL_CLOSED"
+        )
+    allowed = {str(row.get("ticker") or "").strip().upper() for row in _load_json_list(universe)}
+    parsed.selected_tickers = list(dict.fromkeys(
+        ticker.strip().upper() for ticker in parsed.selected_tickers
+        if ticker.strip().upper() in allowed
+    ))[:5]
 
     out: WheelState = {"candidate_selector_output": parsed.model_dump_json()}
     if raw is not None:
@@ -828,12 +803,13 @@ def fundamental_screener_node(state: WheelState) -> WheelState:
         selector = CandidateSelectorOutput.model_validate_json(
             state.get("candidate_selector_output", "") or "{}"
         )
-        if selector.selected_tickers:
-            fundamentals = _filter_json_rows_by_tickers(
-                fundamentals, selector.selected_tickers
-            )
     except Exception:
-        pass
+        return {"screener_output": ScreenerOutput(approved_tickers=[]).model_dump_json()}
+
+    fundamentals = _filter_json_rows_by_tickers(fundamentals, selector.selected_tickers)
+    allowed = {str(row.get("ticker") or "").strip().upper() for row in _load_json_list(fundamentals)}
+    if not allowed:
+        return {"screener_output": ScreenerOutput(approved_tickers=[]).model_dump_json()}
 
     human = f"Input: {fundamentals}"
     if cro_feedback:
@@ -847,6 +823,10 @@ def fundamental_screener_node(state: WheelState) -> WheelState:
     )
     if parsed is None:
         parsed = ScreenerOutput(approved_tickers=[])
+    parsed.approved_tickers = list(dict.fromkeys(
+        ticker.strip().upper() for ticker in parsed.approved_tickers
+        if ticker.strip().upper() in allowed
+    ))[:5]
 
     out: WheelState = {"screener_output": parsed.model_dump_json()}
     if raw is not None:
@@ -1269,7 +1249,7 @@ def distressed_decider_node(state: WheelState) -> WheelState:
             "ticket_source": "OPPORTUNITY_COST_ASSESSOR",
         }
 
-    # APPROVE_ROLL → forward the quant ticket
+    # Quant/assessor suggestions remain visible, but cannot authorize repair.
     if raw_quant:
         try:
             quant = QuantOutput.model_validate_json(raw_quant)
@@ -1283,8 +1263,8 @@ def distressed_decider_node(state: WheelState) -> WheelState:
                     "ticket_source": "DISTRESSED_FAILCLOSED",
                 }
             return {
-                "draft_ticket": raw_quant,
-                "ticket_source": "OPTIONS_QUANT",
+                "draft_ticket": json.dumps({"action": "NO_TRADE", "reason": REPAIR_DISABLED_REASON}),
+                "ticket_source": "DISTRESSED_FAILCLOSED",
             }
         except Exception:
             pass
@@ -1333,7 +1313,9 @@ def ticket_validator_node(state: WheelState) -> WheelState:
     action = str(ticket.get("action", "")).upper()
 
     if action == "LIQUIDATE":
-        return _valid()
+        return _invalid("Autonomous liquidation is not permitted")
+    if action in {"ROLL", "SPREAD"}:
+        return _invalid(REPAIR_DISABLED_REASON)
 
     if source == "PUT_DRAFTER":
         if action != "SELL_CSP":
@@ -1526,34 +1508,27 @@ def retry_router_node(_: WheelState) -> WheelState:
 
 
 def execution_broker_node(state: WheelState) -> WheelState:
-    chain = (state.get("options_chain_input") or "").strip()
+    """Build a single-leg limit order from the approved ticket without an LLM."""
     try:
+        cro = CROOutput.model_validate_json(state.get("cro_output") or "{}")
+        if cro.status != "APPROVED":
+            raise ValueError("CRO_APPROVAL_REQUIRED")
         ticket = json.loads(state.get("draft_ticket", "") or "{}")
-    except json.JSONDecodeError:
-        ticket = {}
-    if str(ticket.get("action") or "").upper() in {
-        "SELL_CSP",
-        "SELL_COVERED_CALL",
-        "CLOSE_SHORT_PUT",
-    }:
-        chain = str(ticket.get("options_chain") or "").strip()
-    human = (
-        f"Approved ticket: {state.get('draft_ticket', '')}\n"
-        f"Options chain context: {chain}"
-    )
-    raw, parsed = _invoke_structured(
-        BrokerOutput, EXECUTION_BROKER_PROMPT, human
-    )
-    if parsed is None:
+        approved = ApprovedOptionOrder.from_ticket(ticket)
+        price = float(approved.midpoint())
         parsed = BrokerOutput(
-            error="LLM_FAILURE",
-            note="Broker call failed; manual execution required",
+            symbol=approved.symbol,
+            qty=approved.qty,
+            side=approved.side,
+            position_intent=approved.position_intent,
+            limit_price=price,
+            initial_limit=price,
+            note="Deterministic rounded midpoint within approved bid/ask bounds.",
         )
+    except (ValueError, TypeError) as exc:
+        parsed = BrokerOutput(error="ORDER_POLICY_BLOCKED", note=str(exc))
 
-    out: WheelState = {"execution_output": parsed.model_dump_json()}
-    if raw is not None:
-        out["messages"] = [raw]
-    return out
+    return {"execution_output": parsed.model_dump_json()}
 
 
 # ── Routing functions ──────────────────────────────────────────────────────

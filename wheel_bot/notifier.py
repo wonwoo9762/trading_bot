@@ -15,6 +15,7 @@ from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from zoneinfo import ZoneInfo
+from execution_guard import order_outcome_label
 
 from config import (
     SMTP_HOST,
@@ -93,11 +94,7 @@ def send_run_report(
 
     plain_tx = ""
     if transaction_summary:
-        outcome = (
-            "Transaction made"
-            if transaction_summary.get("transaction_made")
-            else "No transaction made"
-        )
+        outcome = order_outcome_label(transaction_summary)
         plain_tx = (
             "--- Transaction summary ---\n"
             f"Outcome: {outcome}\n"
@@ -107,6 +104,8 @@ def send_run_report(
         )
         if transaction_summary.get("order_id"):
             plain_tx += f"Order ID: {transaction_summary['order_id']}\n"
+        if transaction_summary.get("client_order_id"):
+            plain_tx += f"Client order ID: {transaction_summary['client_order_id']}\n"
         plain_tx += f"Why: {transaction_summary.get('why', '')}\n\n"
 
     plain_acct = ""
@@ -195,7 +194,7 @@ def _build_html(
         made = bool(transaction_summary.get("transaction_made"))
         accent = "#27ae60" if made else "#c0392b"
         bg = "#edf8f0" if made else "#fff4f2"
-        outcome = "Transaction made" if made else "No transaction made"
+        outcome = order_outcome_label(transaction_summary)
         order_id = transaction_summary.get("order_id")
         order_line = (
             f'<p style="margin:6px 0 0;font-size:13px;color:#555;">'
@@ -203,6 +202,11 @@ def _build_html(
             if order_id
             else ""
         )
+        if transaction_summary.get("client_order_id"):
+            order_line += (
+                '<p style="margin:6px 0 0;font-size:13px;color:#555;">'
+                f'<strong>Client order ID:</strong> {esc(transaction_summary["client_order_id"])}</p>'
+            )
         transaction_html = (
             f'<div style="background:{bg};border:1px solid {accent};border-radius:8px;'
             'padding:14px;margin-bottom:16px;">'

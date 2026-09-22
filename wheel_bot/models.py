@@ -1,7 +1,7 @@
-"""Pydantic schemas for every structured LLM output in the Wheel strategy.
+"""Pydantic schemas for agent outputs and deterministic execution parameters.
 
-These models are used with ``ChatOpenAI.with_structured_output()`` so the API
-enforces the schema via function-calling; downstream code never needs regex.
+Agent models use ``ChatOpenAI.with_structured_output()``. BrokerOutput is
+constructed by code from the approved ticket, without an execution LLM.
 """
 
 from __future__ import annotations
@@ -91,13 +91,14 @@ class BrokerLeg(BaseModel):
 
 
 class BrokerOutput(BaseModel):
-    """Execution Broker limit-order parameters."""
+    """Deterministic execution parameters or a blocking error."""
 
     symbol: Optional[str] = Field(
         default=None,
         description="Alpaca/OCC option contract symbol for simple option orders",
     )
     side: Optional[Literal["buy", "sell"]] = None
+    position_intent: Optional[Literal["sell_to_open", "buy_to_close"]] = None
     qty: Optional[int] = Field(
         default=None,
         description="Whole number of option contracts",
@@ -105,7 +106,7 @@ class BrokerOutput(BaseModel):
     initial_limit: Optional[float] = None
     limit_price: Optional[float] = Field(
         default=None,
-        description="Limit price to submit. For mleg credit orders, use a negative value.",
+        description="Positive single-leg option limit price within approved bid/ask bounds",
     )
     step_down: Optional[float] = None
     floor_price: Optional[float] = None

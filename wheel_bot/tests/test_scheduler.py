@@ -55,6 +55,9 @@ class SchedulerTests(unittest.TestCase):
         )
 
         self.assertTrue(summary["transaction_made"])
+        self.assertTrue(summary["order_submitted"])
+        self.assertFalse(summary["fill_confirmed"])
+        self.assertIn("fill not confirmed", scheduler._format_transaction_summary(summary))
         self.assertEqual(summary["symbol"], "AAPL260116C00170000")
         self.assertIn("CRO approved: Risk reducing", summary["why"])
         self.assertIn("Option limit order submitted.", summary["why"])
@@ -67,6 +70,16 @@ class SchedulerTests(unittest.TestCase):
         self.assertFalse(summary["transaction_made"])
         self.assertEqual(summary["status"], "SKIPPED")
         self.assertEqual(summary["why"], "Not a market day.")
+
+    def test_uncertain_and_reconciled_orders_have_distinct_outcomes(self):
+        for status, expected in (("UNKNOWN", "Order status uncertain"), ("RECONCILED", "Existing order found")):
+            with self.subTest(status=status):
+                summary = scheduler._build_transaction_summary(order_result={
+                    "status": status, "client_order_id": "wheelbot-test", "reason": "Reconcile",
+                })
+                self.assertFalse(summary["order_submitted"])
+                self.assertIn(expected, scheduler._format_transaction_summary(summary))
+                self.assertIn("wheelbot-test", scheduler._format_transaction_summary(summary))
 
     def test_execution_attempt_blocks_without_auto_execute(self):
         result = scheduler._execution_attempt(
@@ -85,6 +98,14 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("CRO did not approve", result["reason"])
+
+    def test_execution_attempt_blocks_malformed_cro_objects(self):
+        for raw in ("[]", "null", "bad json", "42"):
+            with self.subTest(raw=raw):
+                result = scheduler._execution_attempt(
+                    {"cro_output": raw}, auto_execute=True, allow_live_trading=False
+                )
+                self.assertEqual(result["status"], "BLOCKED")
 
     def test_execution_attempt_submits_approved_ticket_through_broker(self):
         class FakeOrder:
@@ -111,6 +132,20 @@ class SchedulerTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "SUBMITTED")
         self.assertEqual(result["order_id"], "order-123")
+
+    def test_auto_execution_cannot_submit_repairs_or_liquidation(self):
+        import broker
+
+        for action in ("ROLL", "SPREAD", "LIQUIDATE"):
+            with self.subTest(action=action):
+                with mock.patch.object(broker, "WheelBroker") as factory:
+                    result = scheduler._execution_attempt({
+                        "cro_output": '{"status":"APPROVED","reason":"Model approval"}',
+                        "draft_ticket": json.dumps({"action": action}),
+                        "execution_output": '{"qty":1,"limit_price":1}',
+                    }, auto_execute=True, allow_live_trading=True)
+                self.assertEqual(result["status"], "BLOCKED")
+                factory.assert_not_called()
 
     def test_run_wheel_sends_email_when_market_is_closed(self):
         sent = []

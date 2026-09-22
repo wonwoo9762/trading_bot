@@ -101,18 +101,6 @@ class GraphTests(unittest.TestCase):
 
         self.assertEqual(result["data_gate_status"], "ok")
 
-    def test_candidate_selector_fallback_uses_static_quality_filters(self):
-        universe = json.dumps(
-            [
-                {"ticker": "AAPL", "fcf": 100, "debt_to_equity": 1.0, "mkt_cap": 1_000_000_000_000},
-                {"ticker": "XYZ", "fcf": -1, "debt_to_equity": 0.1, "mkt_cap": 100_000_000_000},
-            ]
-        )
-
-        selected = graph._deterministic_candidate_fallback(universe)
-
-        self.assertEqual(selected.selected_tickers, ["AAPL"])
-
     def test_cash_options_chain_fetches_after_screener_selects_ticker(self):
         state = {
             "screener_output": json.dumps({"approved_tickers": ["AAPL"]}),
@@ -399,36 +387,69 @@ class GraphTests(unittest.TestCase):
         self.assertEqual(ticket["action"], "NO_TRADE")
         self.assertNotEqual(ticket["action"], "LIQUIDATE")
 
-    def test_execution_broker_receives_only_selected_csp_contract(self):
-        selected_line = (
-            "[Put 300 Exp 2027-01-01 Underlying: AAPL "
-            "Symbol: AAPL270101P00300000 Bid: 2 Ask: 2.1]"
-        )
-        other_line = (
-            "[Put 290 Exp 2027-01-01 Underlying: AAPL "
-            "Symbol: AAPL270101P00290000 Bid: 1 Ask: 1.1]"
-        )
+    def test_execution_broker_constructs_approved_order_without_llm(self):
         state = {
-            "draft_ticket": json.dumps(
-                {"action": "SELL_CSP", "options_chain": selected_line}
-            ),
-            "options_chain_input": selected_line + "\n" + other_line,
+            "cro_output": '{"status":"APPROVED","reason":"Validated"}',
+            "draft_ticket": json.dumps({
+                "action": "SELL_CSP", "symbol": "AAPL270101P00300000",
+                "qty": 4, "bid": 2.0, "ask": 2.1,
+            }),
+            "options_chain_input": "Unrelated contracts must not change execution",
         }
-        parsed = graph.BrokerOutput(
-            symbol="AAPL270101P00300000",
-            side="sell",
-            qty=1,
-            limit_price=2.05,
-        )
+        with mock.patch.object(graph, "_invoke_structured", side_effect=AssertionError("No execution LLM")):
+            result = graph.execution_broker_node(state)
+        order = json.loads(result["execution_output"])
+        self.assertEqual(order["symbol"], "AAPL270101P00300000")
+        self.assertEqual(order["qty"], 4)
+        self.assertEqual(order["limit_price"], 2.05)
+        self.assertEqual(order["position_intent"], "sell_to_open")
+        self.assertEqual(order["legs"], [])
 
-        with mock.patch.object(
-            graph, "_invoke_structured", return_value=(None, parsed)
-        ) as invoke:
-            graph.execution_broker_node(state)
+    def test_execution_broker_blocks_missing_approval_or_bad_ticket(self):
+        approved = '{"status":"APPROVED","reason":"Validated"}'
+        ticket = json.dumps({"action": "SELL_CSP", "symbol": "AAPL270101P00300000", "qty": 1, "bid": 2.0, "ask": 2.1})
+        for state in ({"draft_ticket": ticket}, {"cro_output": approved, "draft_ticket": "[]"}, {"cro_output": approved, "draft_ticket": '{"action":"ROLL"}'}):
+            with self.subTest(state=state):
+                result = json.loads(graph.execution_broker_node(state)["execution_output"])
+                self.assertEqual(result["error"], "ORDER_POLICY_BLOCKED")
 
-        human = invoke.call_args.args[2]
-        self.assertIn("AAPL270101P00300000", human)
-        self.assertNotIn("AAPL270101P00290000", human)
+    def test_empty_invalid_or_missing_candidate_selection_stops_screening(self):
+        fundamentals = json.dumps([{"ticker": "AAPL", "fcf": 100, "debt_to_equity": 0.5, "mkt_cap": 1e12}])
+        for selection in ('{"selected_tickers":[],"reason":"Adverse news"}', "invalid", ""):
+            with self.subTest(selection=selection):
+                with mock.patch.object(graph, "_invoke_structured", side_effect=AssertionError("Veto must stop screening")):
+                    result = graph.fundamental_screener_node({"candidate_selector_output": selection, "fundamentals_input": fundamentals})
+                self.assertEqual(json.loads(result["screener_output"])["approved_tickers"], [])
+
+    def test_selector_failure_fails_closed(self):
+        with mock.patch.object(graph, "_invoke_structured", return_value=(None, None)):
+            result = graph.candidate_selector_node({"candidate_universe_input": '[{"ticker":"AAPL","fcf":100,"debt_to_equity":0.5,"mkt_cap":1000000000000}]'})
+        selection = json.loads(result["candidate_selector_output"])
+        self.assertEqual(selection["selected_tickers"], [])
+        self.assertEqual(selection["reason"], "LLM_FAILURE_FAIL_CLOSED")
+
+    def test_selector_and_screener_cannot_expand_authorized_universe(self):
+        from models import CandidateSelectorOutput, ScreenerOutput
+        state = {"candidate_universe_input": '[{"ticker":"AAPL"}]'}
+        with mock.patch.object(graph, "_invoke_structured", return_value=(None, CandidateSelectorOutput(selected_tickers=[" aapl ", "MSFT", "AAPL"]))):
+            selected = graph.candidate_selector_node(state)
+        self.assertEqual(json.loads(selected["candidate_selector_output"])["selected_tickers"], ["AAPL"])
+        state = {**selected, "fundamentals_input": '[{"ticker":"AAPL"},{"ticker":"MSFT"}]'}
+        with mock.patch.object(graph, "_invoke_structured", return_value=(None, ScreenerOutput(approved_tickers=["MSFT", "aapl", "AAPL"]))) as invoke:
+            screened = graph.fundamental_screener_node(state)
+        self.assertNotIn("MSFT", invoke.call_args.args[2])
+        self.assertEqual(json.loads(screened["screener_output"])["approved_tickers"], ["AAPL"])
+
+    def test_approved_repair_remains_manual_review(self):
+        for action in ("ROLL", "SPREAD"):
+            with self.subTest(action=action):
+                quant = json.dumps({"action": action, "est_credit": 2.5})
+                result = graph.distressed_decider_node({"quant_output": quant, "opportunity_output": '{"decision":"APPROVE_ROLL","reason":"Positive credit"}'})
+                ticket = json.loads(result["draft_ticket"])
+                self.assertEqual(ticket["action"], "NO_TRADE")
+                self.assertIn("AUTOMATED_REPAIR_DISABLED", ticket["reason"])
+                validation = graph.ticket_validator_node({"draft_ticket": quant, "ticket_source": "OPTIONS_QUANT"})
+                self.assertEqual(validation["ticket_validation_status"], "invalid")
 
     def test_ticket_validator_accepts_nominal_and_rejects_bad_cash_ticket(self):
         invalid = graph.ticket_validator_node(

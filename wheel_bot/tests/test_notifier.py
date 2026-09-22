@@ -57,7 +57,7 @@ class NotifierTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("No transaction made", html)
+        self.assertIn("No new order submitted", html)
         self.assertIn("CRO did not approve.", html)
 
     def test_send_run_report_includes_transaction_summary_in_plain_email(self):
@@ -89,8 +89,18 @@ class NotifierTests(unittest.TestCase):
             for part in message.walk()
             if part.get_content_type() == "text/plain"
         )
-        self.assertIn("Transaction made", plain)
+        self.assertIn("Order submitted; fill not confirmed", plain)
         self.assertIn("order-123", plain)
+
+    def test_uncertain_order_is_not_reported_as_no_transaction(self):
+        html = notifier._build_html(
+            "", run_label="manual", ticker="AAPL",
+            ts=notifier.datetime(2026, 1, 1, tzinfo=notifier.ET),
+            transaction_summary={"status": "UNKNOWN", "client_order_id": "wheelbot-test", "why": "Timeout"},
+        )
+        self.assertIn("Order status uncertain; reconciliation required", html)
+        self.assertIn("wheelbot-test", html)
+        self.assertNotIn("No new order submitted", html)
 
 
 if __name__ == "__main__":

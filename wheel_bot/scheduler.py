@@ -46,6 +46,8 @@ from data_feeds import (
     is_market_day,
 )
 from notifier import send_run_report
+from execution_guard import order_outcome_label
+from order_policy import SINGLE_LEG_ACTIONS
 
 ET = ZoneInfo("America/New_York")
 DB_DIR = Path(__file__).resolve().parent / "data"
@@ -94,10 +96,7 @@ def _execution_attempt(
             "reason": "WHEEL_BOT_AUTO_EXECUTE is false; no order submitted.",
         }
 
-    try:
-        cro = json.loads(graph_state.get("cro_output") or "{}")
-    except json.JSONDecodeError:
-        cro = {}
+    cro = _load_json_object(graph_state.get("cro_output"))
 
     if str(cro.get("status", "")).upper() != "APPROVED":
         return {
@@ -112,6 +111,14 @@ def _execution_attempt(
         return {
             "status": "BLOCKED",
             "reason": "Missing draft_ticket or execution_output.",
+        }
+
+    # Configured auto-execution never grants liquidation or repair authority.
+    ticket = _load_json_object(draft_ticket)
+    if str(ticket.get("action") or "").upper() not in SINGLE_LEG_ACTIONS:
+        return {
+            "status": "BLOCKED",
+            "reason": "Automated execution supports only CSP entries, covered calls, and short-put closes.",
         }
 
     try:
@@ -187,11 +194,14 @@ def _build_transaction_summary(
             why = f"CRO result: {cro_reason}"
 
     return {
+        "order_submitted": transaction_made,
+        "fill_confirmed": False,
         "transaction_made": transaction_made,
         "status": status,
         "action": action,
         "symbol": symbol,
         "order_id": order_result.get("order_id"),
+        "client_order_id": order_result.get("client_order_id"),
         "why": why,
         "cro_reason": cro_reason,
         "broker_reason": broker_reason,
@@ -199,11 +209,7 @@ def _build_transaction_summary(
 
 
 def _format_transaction_summary(summary: dict[str, Any]) -> str:
-    outcome = (
-        "Transaction made"
-        if summary.get("transaction_made")
-        else "No transaction made"
-    )
+    outcome = order_outcome_label(summary)
     lines = [
         f"Outcome: {outcome}",
         f"Status: {summary.get('status', 'N/A')}",
@@ -212,6 +218,8 @@ def _format_transaction_summary(summary: dict[str, Any]) -> str:
     ]
     if summary.get("order_id"):
         lines.append(f"Order ID: {summary['order_id']}")
+    if summary.get("client_order_id"):
+        lines.append(f"Client order ID: {summary['client_order_id']}")
     lines.append(f"Why: {summary.get('why', '')}")
     return "\n".join(lines)
 
