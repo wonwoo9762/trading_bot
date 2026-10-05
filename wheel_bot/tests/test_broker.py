@@ -23,9 +23,14 @@ class FakeTradingClient:
         self.closed = []
         self.broker_orders = {}
         self.open_orders = []
+        self.positions = []
+        self.account = types.SimpleNamespace(id="offline-account", cash="1000000", portfolio_value="1000000", buying_power="1000000")
 
     def get_account(self):
-        return types.SimpleNamespace(id="offline-account")
+        return self.account
+
+    def get_all_positions(self):
+        return self.positions
 
     def get_orders(self, filter):
         return self.open_orders
@@ -66,6 +71,41 @@ class BrokerTests(unittest.TestCase):
         b = make_broker(client=client)
         ticket = json.dumps({"action": "SELL_CSP", "symbol": symbol, "qty": 1, "bid": 2, "ask": 2.2})
         return b, ticket, '{"limit_price":2.1}'
+
+    def test_fresh_cash_and_concentration_check_blocks_previously_drafted_order(self):
+        for cash, nlv in ((1000, 1000000), (100000, 100000)):
+            b, ticket, params = self._valid_order()
+            b._client.account.cash = cash
+            b._client.account.portfolio_value = nlv
+            result = b.execute(ticket, params, human_approved=True)
+            self.assertEqual(result.status, "BLOCKED")
+            self.assertIn("ALLOCATION_CHANGED", result.reason)
+            self.assertEqual(b._client.orders, [])
+
+    def test_fresh_stock_or_put_exposure_blocks_duplicate_underlying(self):
+        for symbol, qty in (("AAPL", 100), ("AAPL270101P00200000", -1)):
+            b, ticket, params = self._valid_order()
+            b._client.positions = [types.SimpleNamespace(symbol=symbol, qty=qty, current_price=2, avg_entry_price=2, market_value=200)]
+            result = b.execute(ticket, params, human_approved=True)
+            self.assertEqual(result.status, "BLOCKED")
+            self.assertIn("already has exposure", result.reason)
+
+    def test_fresh_positions_cannot_be_missing_or_nonfinite(self):
+        b, ticket, params = self._valid_order()
+        for positions in (None, [types.SimpleNamespace(symbol="MSFT", qty=float("nan"))]):
+            with mock.patch.object(b._client, "get_all_positions", return_value=positions):
+                result = b.execute(ticket, params, human_approved=True)
+            self.assertEqual(result.status, "BLOCKED")
+            self.assertEqual(b._client.orders, [])
+
+    def test_cannot_close_put_or_cover_call_without_fresh_holdings(self):
+        for action, symbol in (("CLOSE_SHORT_PUT", "AAPL270101P00300000"), ("SELL_COVERED_CALL", "AAPL270101C00300000")):
+            b = make_broker()
+            ticket = json.dumps(dict(action=action, symbol=symbol, qty=1, bid=1, ask=1.2))
+            result = b.execute(ticket, '{"limit_price":1.1}', human_approved=True)
+            self.assertEqual(result.status, "BLOCKED")
+            self.assertIn("POSITION_CHANGED", result.reason)
+            self.assertEqual(b._client.orders, [])
 
     def test_restart_cannot_submit_same_intent_again_even_after_fill(self):
         b, ticket, params = self._valid_order()
@@ -251,6 +291,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_simple_option_limit_order_is_submitted(self):
         client = FakeTradingClient()
+        client.positions = [types.SimpleNamespace(symbol="AAPL", qty="100", current_price="170", avg_entry_price="160", market_value="17000")]
         b = make_broker(client=client)
 
         result = b.execute(
@@ -281,6 +322,7 @@ class BrokerTests(unittest.TestCase):
 
     def test_close_short_put_is_exact_and_buy_to_close(self):
         client = FakeTradingClient()
+        client.positions = [types.SimpleNamespace(symbol="AAPL270101P00300000", qty="-2", current_price="0.9", avg_entry_price="2", market_value="-180")]
         b = make_broker(client=client)
         ticket = {
             "action": "CLOSE_SHORT_PUT",

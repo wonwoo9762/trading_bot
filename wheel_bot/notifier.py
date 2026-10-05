@@ -118,7 +118,7 @@ def send_run_report(
         for pos in account_snapshot.get("positions", []):
             pnl_sign = "+" if pos["unrealized_pl"] >= 0 else ""
             plain_acct += (
-                f"  {pos['symbol']}: {pos['qty']} shares @ ${pos['avg_entry']:.2f} → "
+                f"  {pos['symbol']}: {pos['qty']:g} {pos.get('quantity_unit', 'shares')} @ ${pos['avg_entry']:.2f} → "
                 f"${pos['current_price']:.2f}  "
                 f"({pnl_sign}${pos['unrealized_pl']:,.2f} / {pnl_sign}{pos['unrealized_pct']:.1f}%)\n"
             )
@@ -291,7 +291,7 @@ def _build_html(
                 account_html += (
                     f'<tr style="border-bottom:1px solid #eee;">'
                     f'<td style="padding:6px 8px;font-weight:600;">{pos["symbol"]}</td>'
-                    f'<td style="padding:6px 8px;text-align:right;">{pos["qty"]}</td>'
+                    f'<td style="padding:6px 8px;text-align:right;">{pos["qty"]:g} {esc(pos.get("quantity_unit", "shares"))}</td>'
                     f'<td style="padding:6px 8px;text-align:right;">${pos["avg_entry"]:.2f}</td>'
                     f'<td style="padding:6px 8px;text-align:right;">${pos["current_price"]:.2f}</td>'
                     f'<td style="padding:6px 8px;text-align:right;">${pos["market_value"]:,.2f}</td>'

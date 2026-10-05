@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import re
+from collections import Counter
 from datetime import date, datetime, timezone
 from typing import Annotated, Any, TypedDict, TypeVar
 
@@ -37,6 +38,10 @@ from pydantic import BaseModel
 from config import require_openai_key
 from guardrails import build_agent_system, human_payload_suspicious
 from order_policy import ApprovedOptionOrder, REPAIR_DISABLED_REASON
+from portfolio_policy import (
+    MAX_POSITION_PCT, MAX_TOTAL_CSP_PCT,
+    CSP_MIN_ANNUALIZED_YIELD_PCT, CSP_MAX_ANNUALIZED_YIELD_PCT, entry_budget,
+)
 from models import (
     AssessorOutput,
     BrokerOutput,
@@ -68,14 +73,10 @@ logger = logging.getLogger(__name__)
 
 CRO_REJECT_MAX = 3
 TICKET_VALIDATION_MAX = 3
-MAX_POSITION_PCT = 0.15
-MAX_TOTAL_CSP_PCT = 0.50
 CSP_MIN_DTE = 7
 CSP_MAX_DTE = 45
 CSP_MIN_POP_PCT = 70.0
 CSP_MAX_POP_PCT = 85.0
-CSP_MIN_ANNUALIZED_YIELD_PCT = 20.0
-CSP_MAX_ANNUALIZED_YIELD_PCT = 35.0
 CSP_MIN_OPEN_INTEREST = 100
 CSP_MAX_SPREAD_PCT = 20.0
 SHORT_PUT_PROFIT_TAKE_PCT = 50.0
@@ -206,7 +207,10 @@ def _derive_route_from_portfolio(portfolio_state: str) -> str | None:
         cost = float(data.get("cost_basis") or 0)
     except (TypeError, ValueError):
         return None
-    short_puts = data.get("short_puts") or []
+    scope = data.get("evaluation_scope")
+    if scope == "entry":
+        return "CASH"
+    short_puts = [] if scope == "equity" else data.get("short_puts") or []
     if isinstance(short_puts, list):
         for item in short_puts:
             if not isinstance(item, dict):
@@ -289,6 +293,8 @@ def _parse_portfolio(raw: str) -> dict[str, Any] | None:
         "short_put_collateral_by_underlying": collateral_by_underlying,
         "short_puts": normalized_short_puts,
         "short_calls": data.get("short_calls") or [],
+        "equity_positions": data.get("equity_positions") or [],
+        "unsupported_positions": data.get("unsupported_positions") or [],
         "position_pct": (position_value / nlv * 100) if nlv > 0 else 0,
     }
 
@@ -396,20 +402,17 @@ def _select_cash_secured_put_contract(
     if not puts:
         return None, "options chain contained no put contracts"
 
-    nlv = float(portfolio.get("nlv") or 0)
-    cash = float(portfolio.get("cash") or 0)
-    existing_total = float(portfolio.get("short_put_collateral") or 0)
-    existing_by_underlying = portfolio.get(
-        "short_put_collateral_by_underlying", {}
-    )
-    if not isinstance(existing_by_underlying, dict):
-        existing_by_underlying = {}
-    total_remaining = min(
-        max(0.0, MAX_TOTAL_CSP_PCT * nlv - existing_total),
-        max(0.0, cash - existing_total),
-    )
+    try:
+        budget = entry_budget(portfolio)
+    except ValueError as exc:
+        return None, f"invalid allocation inputs: {exc}"
+    if portfolio.get("unsupported_positions"):
+        return None, "unsupported account exposures require manual review"
+    nlv = budget["nlv"]
+    total_remaining = budget["remaining"]
 
     eligible: list[dict[str, Any]] = []
+    rejected: Counter[str] = Counter()
     for c in puts:
         bid = c.get("bid")
         ask = c.get("ask")
@@ -427,6 +430,7 @@ def _select_cash_secured_put_contract(
             or open_interest is None
             or not underlying
         ):
+            rejected["missing_quote_greeks_or_liquidity"] += 1
             continue
         bid = float(bid)
         ask = float(ask)
@@ -435,16 +439,21 @@ def _select_cash_secured_put_contract(
         dte = int(dte)
         open_interest = int(open_interest)
         if bid <= 0 or ask < bid:
+            rejected["invalid_quote"] += 1
             continue
         if not CSP_MIN_DTE <= dte <= CSP_MAX_DTE:
+            rejected["expiration"] += 1
             continue
         if not CSP_MIN_POP_PCT <= pop <= CSP_MAX_POP_PCT:
+            rejected["delta_proxy_probability"] += 1
             continue
         if open_interest < CSP_MIN_OPEN_INTEREST:
+            rejected["open_interest"] += 1
             continue
         mid = (bid + ask) / 2
         spread_pct = ((ask - bid) / mid * 100) if mid > 0 else 100.0
         if spread_pct > CSP_MAX_SPREAD_PCT:
+            rejected["spread"] += 1
             continue
         annualized_yield = (
             bid / (strike - bid) * (365 / dte) * 100
@@ -456,6 +465,7 @@ def _select_cash_secured_put_contract(
             <= annualized_yield
             <= CSP_MAX_ANNUALIZED_YIELD_PCT
         ):
+            rejected["annualized_premium_yield"] += 1
             continue
         abs_delta = abs(float(c.get("delta") or (1.0 - pop / 100.0)))
         annualized_spread_cost = _annualized_spread_cost_pct(
@@ -474,12 +484,14 @@ def _select_cash_secured_put_contract(
             )
         )
         # Do not overlap CSP cycles in one underlying. Diversify the next entry.
-        if float(existing_by_underlying.get(underlying, 0) or 0) > 0:
+        if underlying in budget["occupied_underlyings"]:
+            rejected["existing_underlying_exposure"] += 1
             continue
         collateral_per_contract = strike * 100
         allowed_collateral = min(MAX_POSITION_PCT * nlv, total_remaining)
         qty = int(allowed_collateral // collateral_per_contract)
         if qty < 1:
+            rejected["insufficient_allocation_for_one_contract"] += 1
             continue
         candidate = dict(c)
         candidate["mid"] = round(mid, 2)
@@ -509,6 +521,7 @@ def _select_cash_secured_put_contract(
                 "20-35% "
                 "annualized collateral yield, OI >= 100, spread <= 20%, "
                 "cash/concentration limits, and no-overlap rules"
+                f"; first rejection reason counts: {dict(rejected)}"
             ),
         )
 
@@ -699,6 +712,16 @@ def data_gate_node(state: WheelState) -> WheelState:
     """Require path-specific inputs before spending tokens on drafters."""
     route = (state.get("route_to") or "").upper()
     reasons: list[str] = []
+    try:
+        raw_pf = json.loads(state.get("portfolio_state") or "{}")
+    except (TypeError, ValueError):
+        raw_pf = {}
+        reasons.append("portfolio_state is invalid JSON")
+    if isinstance(raw_pf, dict) and raw_pf.get("evaluation_scope"):
+        if raw_pf["evaluation_scope"] not in {"entry", "equity"}:
+            reasons.append("unknown account evaluation scope")
+        if raw_pf.get("positions_complete") is not True or not isinstance(raw_pf.get("equity_positions"), list):
+            reasons.append("account allocation requires a complete portfolio snapshot")
 
     if not (state.get("portfolio_state") or "").strip():
         reasons.append("portfolio_state is empty")
@@ -1083,6 +1106,7 @@ def short_put_manager_node(state: WheelState) -> WheelState:
     }
     close_candidates: list[dict[str, Any]] = []
     observations: list[str] = []
+    manual_review = False
     for position in positions:
         symbol = str(position.get("symbol") or "")
         quote = contracts.get(symbol)
@@ -1098,11 +1122,15 @@ def short_put_manager_node(state: WheelState) -> WheelState:
             )
         except (TypeError, ValueError):
             observations.append(f"{symbol}: missing entry, quantity, quote, or DTE")
+            manual_review = True
             continue
         if entry_credit <= 0 or qty < 1 or ask <= 0 or ask < bid:
             observations.append(f"{symbol}: quote or entry credit is not executable")
+            manual_review = True
             continue
         profit_capture_pct = (entry_credit - ask) / entry_credit * 100
+        if profit_capture_pct < 0 or abs(float(quote.get("delta") or 0)) >= 0.5:
+            manual_review = True
         regular_close = profit_capture_pct >= SHORT_PUT_PROFIT_TAKE_PCT
         expiry_close = (
             dte <= SHORT_PUT_EXPIRY_DTE
@@ -1136,6 +1164,7 @@ def short_put_manager_node(state: WheelState) -> WheelState:
             "draft_ticket": json.dumps(
                 {
                     "action": "NO_TRADE",
+                    "manual_review_required": manual_review,
                     "reason": (
                         "Open short put remains below deterministic close thresholds; "
                         "hold or manually review threatened/losing positions. "
@@ -1866,6 +1895,8 @@ def _format_result(result: dict[str, Any]) -> str:
         sections.append("DATA_GATE:\n" + (result.get("data_gate_reason") or ""))
 
     for key, label in [
+        ("allocation_summary", "ACCOUNT_ALLOCATION"),
+        ("account_evaluations", "ACCOUNT_EVALUATIONS"),
         ("macro_output", "MACRO_SENTINEL"),
         ("orchestrator_output", "ORCHESTRATOR"),
         ("candidate_selector_output", "CANDIDATE_SELECTOR"),
@@ -1878,7 +1909,7 @@ def _format_result(result: dict[str, Any]) -> str:
     ]:
         val = result.get(key)
         if val:
-            sections.append(f"{label}:\n{val}")
+            sections.append(f"{label}:\n{json.dumps(val, indent=2) if isinstance(val, (dict, list)) else val}")
 
     return (
         "\n\n".join(sections)

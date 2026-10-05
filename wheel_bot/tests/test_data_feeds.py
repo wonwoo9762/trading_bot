@@ -81,6 +81,22 @@ class DataFeedTests(unittest.TestCase):
         self.assertEqual(payload["ticker"], "MSFT")
         self.assertEqual(payload["cash"], 5000.0)
         self.assertEqual(payload["shares"], 50)
+        self.assertTrue(payload["positions_complete"])
+        self.assertEqual([p["ticker"] for p in payload["equity_positions"]], ["AAPL", "MSFT"])
+
+    def test_option_report_uses_contract_units_and_correct_short_pnl_denominator(self):
+        position = types.SimpleNamespace(symbol="AAPL270101P00300000", qty="-2", avg_entry_price="2", current_price="1", market_value="-200", unrealized_pl="200")
+        with mock.patch.object(data_feeds, "_get_trading_client", return_value=FakeClient(positions=[position])):
+            result = data_feeds.fetch_account_summary()["positions"][0]
+        self.assertEqual(result["quantity_unit"], "contracts")
+        self.assertEqual(result["contract_multiplier"], 100)
+        self.assertEqual(result["unrealized_pct"], 50)
+
+    def test_uncovered_call_blocks_additional_account_risk(self):
+        position = types.SimpleNamespace(symbol="AAPL270101C00300000", qty="-2", avg_entry_price="2", current_price="1", market_value="-200")
+        with mock.patch.object(data_feeds, "_get_trading_client", return_value=FakeClient(positions=[position])):
+            pf = json.loads(data_feeds.fetch_portfolio())
+        self.assertIn("AAPL: uncovered short calls", pf["unsupported_positions"])
 
     def test_fetch_portfolio_returns_cash_state_when_ticker_missing(self):
         client = FakeClient(positions=[])

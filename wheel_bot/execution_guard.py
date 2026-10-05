@@ -144,6 +144,12 @@ class ExecutionGuard:
                 raise ExecutionBlocked("OPEN_ORDER_CHECK_FAILED: expected an order list")
             if orders:
                 raise ExecutionBlocked("PENDING_ORDER: account has an open order; reconcile it before submitting")
+            from portfolio_policy import validate_fresh_exposure
+
+            refreshed_account = client.get_account()
+            if str(_field(refreshed_account, "id")) != account_id:
+                raise ExecutionBlocked("ACCOUNT_CHANGED: account identity changed during preflight")
+            validate_fresh_exposure(refreshed_account, client.get_all_positions(), approved)
             conn.execute(
                 "INSERT INTO order_intents (account_key, client_order_id, created_at, payload) VALUES (?, ?, ?, ?)",
                 (account_key, client_id, now.isoformat(), json.dumps({

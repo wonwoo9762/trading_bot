@@ -99,6 +99,14 @@ class SchedulerTests(unittest.TestCase):
         self.assertEqual(result["status"], "BLOCKED")
         self.assertIn("CRO did not approve", result["reason"])
 
+    def test_no_trade_and_macro_reasons_are_preserved(self):
+        for state, reason in (
+            ({"draft_ticket": '{"action":"NO_TRADE","reason":"Allocation full"}'}, "Allocation full"),
+            ({"macro_output": '{"status":"HALT","reason":"Event risk"}'}, "Event risk"),
+        ):
+            result = scheduler._execution_attempt(state, auto_execute=True, allow_live_trading=False)
+            self.assertIn(reason, result["reason"])
+
     def test_execution_attempt_blocks_malformed_cro_objects(self):
         for raw in ("[]", "null", "bad json", "42"):
             with self.subTest(raw=raw):

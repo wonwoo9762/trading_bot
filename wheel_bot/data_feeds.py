@@ -12,6 +12,7 @@ import logging
 import os
 import re
 from datetime import date, datetime, timedelta, timezone
+from portfolio_policy import finite_number
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +33,8 @@ def _get_trading_client():
 def fetch_portfolio(ticker: str | None = None) -> str:
     """Build the portfolio JSON the graph expects.
 
-    If *ticker* is provided, returns data for that specific position.
-    Otherwise picks the largest equity position (by market value).
+    The top-level equity focus is *ticker* or the largest holding. All equity
+    and short-option positions remain available to the account allocator.
 
     Returns JSON like::
 
@@ -42,9 +43,30 @@ def fetch_portfolio(ticker: str | None = None) -> str:
     """
     client = _get_trading_client()
     account = client.get_account()
-    cash = float(account.cash)
-
     positions = client.get_all_positions()
+    return json.dumps(portfolio_from_broker(account, positions, ticker))
+
+
+def portfolio_from_broker(account, positions: list, ticker: str | None = None) -> dict:
+    """Retain every holding, even when a ticker is selected for management."""
+    if not isinstance(positions, list):
+        raise ValueError("Complete broker position list is required")
+    cash = finite_number(account.cash, "account cash")
+    nlv = finite_number(account.portfolio_value, "account portfolio value")
+    unsupported = []
+    for position in positions:
+        qty = finite_number(position.qty, "position quantity")
+        for name in ("current_price", "avg_entry_price", "market_value"):
+            finite_number(getattr(position, name, None), name)
+        symbol = str(position.symbol).upper()
+        option = _parse_occ_option_symbol(symbol)
+        asset_class = str(getattr(position, "asset_class", ""))
+        if option and qty != int(qty):
+            raise ValueError("Fractional option contract quantity")
+        if (option and qty > 0) or (not option and qty < 0) or (
+            not option and asset_class and "us_equity" not in asset_class.lower()
+        ):
+            unsupported.append(symbol)
 
     equity_positions = [
         p for p in positions if _parse_occ_option_symbol(str(p.symbol)) is None
@@ -52,6 +74,21 @@ def fetch_portfolio(ticker: str | None = None) -> str:
     short_puts = _short_put_exposures(positions)
     short_calls = _short_call_exposures(positions)
     short_put_collateral = sum(p["collateral"] for p in short_puts)
+    equities = [
+        {
+            "ticker": str(p.symbol).upper(),
+            "shares": finite_number(p.qty, "shares"),
+            "spot": finite_number(p.current_price, "spot"),
+            "cost_basis": finite_number(p.avg_entry_price, "cost basis"),
+            "market_value": finite_number(p.market_value, "market value"),
+        }
+        for p in equity_positions
+    ]
+    for underlying in {p["underlying"] for p in short_calls}:
+        covered_shares = sum(p["shares"] for p in equities if p["ticker"] == underlying)
+        required_shares = 100 * sum(p["qty"] for p in short_calls if p["underlying"] == underlying)
+        if required_shares > covered_shares:
+            unsupported.append(f"{underlying}: uncovered short calls")
 
     target = None
     if ticker:
@@ -80,33 +117,32 @@ def fetch_portfolio(ticker: str | None = None) -> str:
 
     common = {
         "cash": cash,
-        "nlv": float(account.portfolio_value),
-        "buying_power": float(account.buying_power),
+        "nlv": nlv,
+        "buying_power": finite_number(account.buying_power, "buying power"),
+        "positions_complete": True,
+        "equity_positions": equities,
+        "unsupported_positions": unsupported,
         "short_put_collateral": round(short_put_collateral, 2),
         "short_puts": short_puts,
         "short_calls": short_calls,
     }
 
     if target is None:
-        return json.dumps(
-            {
-                "ticker": lifecycle_ticker or "NONE",
-                "spot": 0,
-                "cost_basis": 0,
-                "shares": 0,
-                **common,
-            }
-        )
-
-    return json.dumps(
-        {
-            "ticker": target.symbol,
-            "spot": float(target.current_price),
-            "cost_basis": float(target.avg_entry_price),
-            "shares": int(float(target.qty)),
+        return {
+            "ticker": lifecycle_ticker or "NONE",
+            "spot": 0,
+            "cost_basis": 0,
+            "shares": 0,
             **common,
         }
-    )
+
+    return {
+        "ticker": target.symbol,
+        "spot": float(target.current_price),
+        "cost_basis": float(target.avg_entry_price),
+        "shares": finite_number(target.qty, "shares"),
+        **common,
+    }
 
 
 def _parse_occ_option_symbol(symbol: str) -> dict[str, object] | None:
@@ -204,13 +240,13 @@ def summarize_portfolio_json_for_email(portfolio_json: str) -> str:
     shares = float(d.get("shares") or 0)
     spot = float(d.get("spot") or 0)
     cost = float(d.get("cost_basis") or 0)
-    nlv = cash + shares * spot
+    nlv = float(d.get("nlv") or (cash + shares * spot))
     ticker = d.get("ticker") or "—"
     return (
         f"Ticker: {ticker}\n"
         f"Cash: ${cash:,.2f}\n"
         f"Shares: {int(shares)} @ spot ${spot:.2f} (cost basis ${cost:.2f})\n"
-        f"Implied NLV (cash + position): ${nlv:,.2f}"
+        f"Account NLV: ${nlv:,.2f}"
     )
 
 
@@ -239,12 +275,16 @@ def fetch_account_summary() -> dict:
     pos_list = []
     for p in positions:
         market_val = float(p.market_value)
-        cost = float(p.avg_entry_price) * float(p.qty)
+        option = _parse_occ_option_symbol(str(p.symbol))
+        multiplier = 100 if option else 1
+        cost = abs(float(p.avg_entry_price) * float(p.qty) * multiplier)
         unrealized = float(p.unrealized_pl)
         pct = (unrealized / cost * 100) if cost else 0.0
         pos_list.append({
             "symbol": p.symbol,
-            "qty": int(float(p.qty)),
+            "qty": float(p.qty),
+            "quantity_unit": "contracts" if option else "shares",
+            "contract_multiplier": multiplier,
             "avg_entry": float(p.avg_entry_price),
             "current_price": float(p.current_price),
             "market_value": market_val,

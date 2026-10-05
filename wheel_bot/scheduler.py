@@ -48,6 +48,8 @@ from data_feeds import (
 from notifier import send_run_report
 from execution_guard import order_outcome_label
 from order_policy import SINGLE_LEG_ACTIONS
+from account_cycle import evaluate_account
+from performance import fetch_performance_summary
 
 ET = ZoneInfo("America/New_York")
 DB_DIR = Path(__file__).resolve().parent / "data"
@@ -89,6 +91,15 @@ def _execution_attempt(
             "status": "BLOCKED",
             "reason": f"Graph aborted: {graph_state.get('abort_reason')}",
         }
+
+    draft = _load_json_object(graph_state.get("draft_ticket"))
+    if draft.get("action") == "NO_TRADE":
+        return {"status": "SKIPPED", "reason": draft.get("reason") or "No eligible trade"}
+    if graph_state.get("data_gate_status") == "blocked":
+        return {"status": "BLOCKED", "reason": graph_state.get("data_gate_reason") or "Required data unavailable"}
+    macro = _load_json_object(graph_state.get("macro_output"))
+    if macro.get("status") == "HALT" and not graph_state.get("execution_output"):
+        return {"status": "BLOCKED", "reason": f"Macro halt: {macro.get('reason', 'New risk blocked')}"}
 
     if not auto_execute:
         return {
@@ -250,9 +261,11 @@ def _send_trigger_report(
             f"{json.dumps(order_result, indent=2, sort_keys=True)}"
         )
 
-    logger.info("=== Result ===\n%s", report)
-
     account = fetch_account_summary()
+    if account.get("portfolio_value", 0) > 0:
+        performance = fetch_performance_summary()
+        report += "\n\nACCOUNT_PERFORMANCE:\n" + json.dumps(performance, indent=2)
+    logger.info("=== Result ===\n%s", report)
     send_run_report(
         report,
         run_label=run_label,
@@ -321,7 +334,7 @@ def run_wheel(
         macro = ""
 
     try:
-        candidate_tickers = [resolved_ticker] if resolved_ticker != "NONE" else None
+        candidate_tickers = [ticker.upper()] if ticker else None
         candidate_universe = fetch_candidate_universe(candidate_tickers)
         logger.info("Candidate universe: %s", candidate_universe)
     except Exception:
@@ -341,7 +354,12 @@ def run_wheel(
             for item in (pf.get("short_puts") or [])
             if isinstance(item, dict) and item.get("underlying")
         }
-        chain_tickers = sorted(short_put_tickers)
+        equity_tickers = {
+            str(item["ticker"]).upper()
+            for item in pf.get("equity_positions", []) if item.get("shares", 0) > 0
+            and (not ticker or item["ticker"] == ticker.upper())
+        }
+        chain_tickers = sorted(short_put_tickers | equity_tickers)
         if not chain_tickers and resolved_ticker != "NONE":
             chain_tickers = [resolved_ticker]
         chain = "\n".join(fetch_options_chain(symbol) for symbol in chain_tickers)
@@ -384,8 +402,10 @@ def run_wheel(
     thread_id = f"wheel-{now.strftime('%Y%m%d-%H%M%S')}-{run_label}"
 
     try:
-        graph_state = run_trading_flow_state(
+        graph_state = evaluate_account(
             portfolio_json,
+            run_flow=run_trading_flow_state,
+            focus_ticker=ticker,
             macro_input=macro,
             candidate_universe_input=candidate_universe,
             fundamentals_input=fundamentals,
@@ -440,7 +460,7 @@ def main() -> None:
         "--ticker",
         type=str,
         default=None,
-        help="Focus on a specific ticker (default: largest position)",
+        help="Restrict equity management and new candidates to a ticker (default: whole account)",
     )
     parser.add_argument(
         "--morning",

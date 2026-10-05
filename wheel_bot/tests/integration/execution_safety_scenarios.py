@@ -37,6 +37,8 @@ from alpaca.trading.requests import LimitOrderRequest
 from alpaca.common.exceptions import APIError
 from agents import graph
 from broker import WheelBroker
+from account_cycle import evaluate_account
+from data_feeds import portfolio_from_broker
 from models import (
     AssessorOutput, CandidateSelectorOutput, CROOutput, MacroSentinelOutput,
     OrchestratorOutput, QuantOutput, ScreenerOutput,
@@ -47,9 +49,14 @@ class FakeTransport:
     def __init__(self):
         self.orders = []
         self.broker_orders = {}
+        self.positions = []
+        self.account = SimpleNamespace(id="offline-account", cash="1000000", portfolio_value="1000000", buying_power="1000000")
 
     def get_account(self):
-        return SimpleNamespace(id="offline-account")
+        return self.account
+
+    def get_all_positions(self):
+        return self.positions
 
     def get_orders(self, filter):
         return []
@@ -106,6 +113,14 @@ class ExecutionSafetyIntegrationTests(unittest.TestCase):
 
     def run_flow(self, portfolio=None, **inputs):
         portfolio = portfolio or {"cash": 1_000_000, "shares": 0, "nlv": 1_000_000}
+        self.broker._client.account.cash = portfolio["cash"]
+        self.broker._client.account.portfolio_value = portfolio.get("nlv", portfolio["cash"] + portfolio.get("shares", 0) * portfolio.get("spot", 0))
+        positions = []
+        if portfolio.get("shares"):
+            positions.append(SimpleNamespace(symbol=portfolio["ticker"], qty=portfolio["shares"], current_price=portfolio["spot"], avg_entry_price=portfolio["cost_basis"], market_value=portfolio["shares"] * portfolio["spot"]))
+        for put in portfolio.get("short_puts", []):
+            positions.append(SimpleNamespace(symbol=put["symbol"], qty=-put["qty"], current_price=1, avg_entry_price=put["entry_credit"], market_value=-100 * put["qty"]))
+        self.broker._client.positions = positions
         defaults = dict(
             macro_input="Offline fixture: VIX 15, no imminent events",
             candidate_universe_input=self.universe,
@@ -213,6 +228,103 @@ class ExecutionSafetyIntegrationTests(unittest.TestCase):
         retried = self.broker.execute(state["draft_ticket"], state["execution_output"], human_approved=True)
         self.assertEqual(retried.status, "BLOCKED")
         self.assertEqual(len(self.broker._client.orders), 1)
+
+    def run_diversified_account(self, *, existing_qty=1, macro_halt=False):
+        """Real graph + request models; only external data/agent/transport are fixtures."""
+        msft = self.put.replace("AAPL", "MSFT")
+        self.responses[CandidateSelectorOutput] = CandidateSelectorOutput(selected_tickers=["AAPL", "MSFT"])
+        self.responses[ScreenerOutput] = ScreenerOutput(approved_tickers=["AAPL", "MSFT"])
+        if macro_halt:
+            self.responses[MacroSentinelOutput] = MacroSentinelOutput(status="HALT", reason="Offline risk event")
+        self.broker._client.positions = [SimpleNamespace(
+            symbol=self.put, qty=-existing_qty, current_price=1.8,
+            avg_entry_price=2, market_value=-180 * existing_qty,
+        )]
+        pf = portfolio_from_broker(self.broker._client.account, self.broker._client.positions)
+        rows = json.loads(self.universe)
+        rows.append(rows[0] | {"ticker": "MSFT"})
+        universe = json.dumps(rows)
+
+        def fetch_chain(ticker, **_):
+            return self.chain(bid=1.7, ask=1.8) if ticker == "AAPL" else self.chain().replace("AAPL", "MSFT")
+
+        with patch.object(graph, "_invoke_structured", side_effect=self.invoke), patch("data_feeds.fetch_options_chain", side_effect=fetch_chain):
+            state = evaluate_account(
+                json.dumps(pf), run_flow=graph.run_trading_flow_state,
+                macro_input="Offline macro fixture", candidate_universe_input=universe,
+                fundamentals_input=universe, options_chain_input=fetch_chain("AAPL"),
+            )
+        return state, msft
+
+    def test_held_put_allows_second_underlying_and_preserves_collateral(self):
+        state, msft = self.run_diversified_account()
+        ticket = json.loads(state["draft_ticket"])
+        self.assertEqual((ticket["action"], ticket["symbol"], ticket["qty"]), ("SELL_CSP", msft, 15))
+        self.assertEqual(ticket["existing_short_put_collateral"], 10000)
+        self.assertEqual(ticket["post_trade_total_collateral"], 160000)
+        self.assertEqual([e["scope"] for e in state["account_evaluations"]], ["short_put_management", "entry"])
+        order = self.submit(state)
+        self.assertEqual((order.symbol, order.qty), (msft, 15))
+
+    def test_second_entry_shrinks_to_remaining_account_limit(self):
+        state, msft = self.run_diversified_account(existing_qty=45)
+        ticket = json.loads(state["draft_ticket"])
+        self.assertEqual(ticket["qty"], 5)
+        self.assertEqual(ticket["post_trade_total_collateral"], 500000)
+        self.assertEqual(self.submit(state).symbol, msft)
+
+    def test_open_put_cannot_bypass_macro_halt_for_second_entry(self):
+        state, _ = self.run_diversified_account(macro_halt=True)
+        self.assertNotIn("execution_output", state)
+        self.assertNotIn(CROOutput, self.called)
+        self.assertNotIn(CandidateSelectorOutput, self.called)
+        self.assertEqual(state["allocation_summary"]["csp_collateral"], 10000)
+
+    def test_new_manual_position_between_plan_and_submit_blocks_second_entry(self):
+        state, _ = self.run_diversified_account()
+        self.broker._client.positions.append(SimpleNamespace(symbol="MSFT", qty=100, current_price=100, avg_entry_price=100, market_value=10000))
+        result = self.broker.execute(state["draft_ticket"], state["execution_output"], human_approved=True)
+        self.assertEqual(result.status, "BLOCKED")
+        self.assertIn("already has exposure", result.reason)
+        self.assertEqual(self.broker._client.orders, [])
+
+    def test_existing_covered_stock_allows_entry_in_another_underlying(self):
+        msft = self.put.replace("AAPL", "MSFT")
+        self.responses[CandidateSelectorOutput] = CandidateSelectorOutput(selected_tickers=["MSFT"])
+        self.responses[ScreenerOutput] = ScreenerOutput(approved_tickers=["MSFT"])
+        universe = self.universe.replace("AAPL", "MSFT")
+        self.broker._client.positions = [
+            SimpleNamespace(symbol="AAPL", qty=100, current_price=100, avg_entry_price=100, market_value=10000),
+            SimpleNamespace(symbol=self.call, qty=-1, current_price=1, avg_entry_price=2, market_value=-100),
+        ]
+        pf = portfolio_from_broker(self.broker._client.account, self.broker._client.positions)
+        with patch.object(graph, "_invoke_structured", side_effect=self.invoke), patch("data_feeds.fetch_options_chain", return_value=self.chain().replace("AAPL", "MSFT")):
+            state = evaluate_account(
+                json.dumps(pf), run_flow=graph.run_trading_flow_state, macro_input="Offline macro fixture",
+                candidate_universe_input=universe, fundamentals_input=universe,
+                options_chain_input=self.chain(call=True),
+            )
+        self.assertEqual([row["scope"] for row in state["account_evaluations"]], ["equity_AAPL", "entry"])
+        self.assertEqual(self.submit(state).symbol, msft)
+
+    def test_performance_uses_real_history_request_without_submitting_orders(self):
+        from alpaca.trading.requests import GetPortfolioHistoryRequest
+        from performance import fetch_performance_summary
+        start = 1767225600
+        fixture = dict(timestamp=[start, start + 30 * 86400], equity=[100000, 101000], profit_loss=[0, 1000], profit_loss_pct=[0, .01])
+        requests = []
+
+        def get_history(request):
+            requests.append(request)
+            return fixture
+
+        with patch("config.get_alpaca_trading_client", return_value=SimpleNamespace(get_portfolio_history=get_history)):
+            result = fetch_performance_summary()
+        self.assertEqual(result["status"], "AVAILABLE")
+        self.assertEqual(result["broker_reported_period_return_pct"], 1)
+        self.assertIsInstance(requests[0], GetPortfolioHistoryRequest)
+        self.assertEqual((requests[0].period, requests[0].timeframe), ("1A", "1D"))
+        self.assertEqual(self.broker._client.orders, [])
 
 
 if __name__ == "__main__":

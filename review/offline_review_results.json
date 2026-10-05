@@ -1,0 +1,79 @@
+{
+  "single_leg_approval_bypassed_by_legs": {
+    "approved_qty": 1,
+    "submitted_qty": 50.0,
+    "approved_symbol": "AAPL261005P00100000",
+    "submitted_symbols": [
+      "MSFT261005P00200000",
+      "MSFT261005P00190000"
+    ],
+    "result": "SUBMITTED"
+  },
+  "incomplete_negative_credit_roll_validated": {
+    "ticket_validation_status": "valid",
+    "ticket_validation_reason": "",
+    "validation_retries": 0
+  },
+  "duplicate_submission_not_deduplicated": {
+    "submitted_orders": 2,
+    "different_client_order_ids": true,
+    "single_leg_position_intent": null
+  },
+  "empty_candidate_veto_lost": {
+    "approved_tickers": [
+      "AAPL"
+    ]
+  },
+  "real_graph_stops_new_entries_after_first_put": {
+    "first_collateral": 150000.0,
+    "nlv": 1000000,
+    "next_route": "SHORT_PUT_OPEN",
+    "model_roles_called": [
+      "MacroSentinelOutput",
+      "OrchestratorOutput"
+    ],
+    "next_ticket": {
+      "action": "NO_TRADE",
+      "reason": "Open short put remains below deterministic close thresholds; hold or manually review threatened/losing positions. AAPL261005P00100000: -10.0% captured with 14 DTE"
+    }
+  },
+  "stale_quote_still_produces_entry": {
+    "source_quote_year": 2000,
+    "timestamp_survived": false,
+    "action": "SELL_CSP"
+  },
+  "calendar_classification": {
+    "2026-11-26": true,
+    "2026-11-27": false,
+    "2026-07-03": true,
+    "2026-09-01": false
+  },
+  "option_pnl_percent_wrong_sign_and_multiplier": {
+    "symbol": "AAPL261005P00100000",
+    "qty": -2,
+    "avg_entry": 2.0,
+    "current_price": 1.0,
+    "market_value": -200.0,
+    "unrealized_pl": 200.0,
+    "unrealized_pct": -5000.0
+  },
+  "submitted_is_reported_as_transaction_made": {
+    "transaction_made": true,
+    "status": "SUBMITTED",
+    "action": "N/A",
+    "symbol": "N/A",
+    "order_id": "unfilled-fake-order",
+    "why": "CRO approved and Alpaca accepted the order.",
+    "cro_reason": "",
+    "broker_reason": ""
+  },
+  "real_graph_cro_retries": {
+    "calls": {
+      "CROOutput": 3
+    },
+    "abort_reason": "CRO_REJECTED: exceeded 3 retries.  No transaction will be made; existing positions require manual review.  Last: Synthetic rejection"
+  },
+  "current_model_temperature_normalized": {
+    "effective_temperature": null
+  }
+}

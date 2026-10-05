@@ -1,5 +1,44 @@
 # Wheel Bot
 
+## Account allocation and the 25-30% annual objective
+
+The scheduler now evaluates the whole account: short-put management first,
+then equity holdings (largest first), then new CSP candidates if no management
+order is ready. A held put or an existing covered call no longer prevents an
+entry in another eligible underlying. Every evaluation retains all holdings and
+collateral. At most one order is attempted per scan; later scans can add positions
+after the broker confirms earlier orders are terminal. `--ticker` restricts equity
+management and new candidates, while all short puts and account exposure remain
+visible. Macro halts still block new risk even when an existing put can be managed.
+
+The existing 15% per-underlying and 50% total CSP collateral caps remain in force.
+New CSPs cannot overlap stocks or short options in the same underlying. Missing
+management data, losing/threatened puts, distressed shares, and unsupported
+exposures prevent additional CSP allocation until reviewed. Under the journal
+lock, the broker refreshes account balances and all positions before reserving an
+order, checking collateral, coverage, and the exact quantity available to close.
+
+25-30% is an **annual account return objective before tax**, not a promised result
+or an instruction to raise leverage. Reports separate that objective from current
+CSP utilization, remaining allocation, and contract rejection counts. At continuous
+50% CSP utilization, a 20-35% annual collateral-premium screen corresponds roughly
+to 10-17.5% gross annual account premium. This illustration excludes closing debits,
+losses, fees, idle periods, cash income and stock returns; it is neither a forecast
+nor a hard ceiling on total return. This patch does not demonstrate the objective.
+
+When available, reports include broker-reported account P/L over up to one year
+and the compounded objective for the observed interval. They do not annualize a
+short track record or treat collected premiums as profit. Account P/L includes
+manual trading and is not bot-only attribution or audited cash-flow-adjusted
+performance; transfers, costs outside the account and tax require reconciliation.
+Unavailable history is reported as unavailable. Read-only integration uses the
+[Alpaca portfolio history API](https://docs.alpaca.markets/us/v1.1/reference/getaccountportfoliohistory-1).
+
+Validate full lifecycle behavior in paper trading and evaluate net returns with
+realistic fills, costs and losses before considering risk-policy changes. Static
+fundamentals still block new live CSP entries. No live-data provider, execution
+opt-in, scan schedule, leverage, or automatic repricing is enabled by this patch.
+
 ## Why deployment did not trade
 
 `RunAtLoad` in the macOS plist starts the scheduler process; it does not run a trading cycle by itself. Before this change the process waited until the next 09:45 or 15:30 ET cron time. Also, the package `main.py` only printed a hello message, so deployments that ran the project entrypoint never reached the scheduler.
@@ -94,15 +133,18 @@ bid/ask spread. It never submits a market order or automatically reprices an
 unfilled order. The broker independently rejects changed symbols, quantities,
 sides, intent, added legs, invalid numbers, and out-of-bounds prices.
 
-Quotes are still the approved ticket's snapshot: this does not yet verify freshness,
-contract-specific tick increments, or refresh collateral and positions at submission.
+Quotes are still the approved ticket's snapshot: this does not yet verify freshness
+or contract-specific tick increments. Balances, collateral and positions are
+refreshed at submission, but the broker cannot atomically lock out manual account
+changes or a separate deployment.
 
 ### Position lifecycle
 
 Portfolio routing is deterministic; an LLM cannot route around positions that
 already exist.
 
-- An open short put routes to `SHORT_PUT_OPEN`, not back to a new CSP entry.
+- The management evaluation of an open short put routes to `SHORT_PUT_OPEN`.
+  After a normal hold, a separate account evaluation may consider another underlying.
 - The bot buys back a short put when the current ask captures at least 50% of
   the original credit.
 - Inside 3 DTE, it may buy back after capturing at least 20% to reduce
